@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+import os
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset
 import hydra.utils as hy_utils
 import h5py
 import logging
@@ -14,6 +15,73 @@ import logging
 from omegaconf import DictConfig
 from src.utils import file_sha256
 from src.tokenizers import BaseTokenizer
+
+
+def _to_scalar(value) -> float:
+    """Coerce an HDF5 attribute value (possibly a 0-d / size-1 array) to a Python float."""
+    if isinstance(value, np.ndarray):
+        assert value.size == 1, (
+            f"Expected scalar attribute, got array of size {value.size}. "
+            "Statistics should be global (computed across all embedding values), not per-dimension."
+        )
+        return float(value.item())
+    return float(value)
+
+
+def compute_pooled_train_stats(train_files: List[h5py.File]) -> Dict[str, float]:
+    """Pool min/max/mean/std across multiple per-length training HDF5 files.
+
+    Uses count-weighted pooling so the resulting (mean, std) matches what a
+    single pass over the concatenated training set would compute. The returned
+    dict is empty when the files do not carry the ``emb_*`` attributes.
+    """
+    assert len(train_files) > 0, "Need at least one train file to pool stats"
+    if "emb_min" not in train_files[0].attrs:
+        return {}
+
+    counts = [len(h5["embeddings"]) for h5 in train_files]
+    mus = [_to_scalar(h5.attrs["emb_mean"]) for h5 in train_files]
+    sigmas = [_to_scalar(h5.attrs["emb_std"]) for h5 in train_files]
+    mins = [_to_scalar(h5.attrs["emb_min"]) for h5 in train_files]
+    maxs = [_to_scalar(h5.attrs["emb_max"]) for h5 in train_files]
+
+    total_n = sum(counts)
+    assert total_n > 0, "No training samples found across multi files"
+    pooled_mean = sum(c * m for c, m in zip(counts, mus)) / total_n
+    pooled_var = (
+        sum(c * (s * s + (m - pooled_mean) ** 2) for c, m, s in zip(counts, mus, sigmas))
+        / total_n
+    )
+
+    return {
+        "min": min(mins),
+        "max": max(maxs),
+        "mean": pooled_mean,
+        "std": pooled_var**0.5,
+    }
+
+
+class _LazyH5Reader:
+    """Owns one HDF5 handle per process for the sample-level reads in __getitem__.
+
+    HDF5 handles are not fork-safe: a handle opened in the parent and inherited by
+    a forked DataLoader worker returns corrupt data rather than failing, so the
+    handle is keyed by PID and reopened the first time a given process reads.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._pid: int | None = None
+        self._embeddings = None
+        self._sequences = None
+
+    def datasets(self):
+        if self._pid != os.getpid():
+            handle = h5py.File(self.path, "r", swmr=True)
+            self._embeddings = handle["embeddings"]
+            self._sequences = handle["sequences"]
+            self._pid = os.getpid()
+        return self._embeddings, self._sequences
 
 
 class DNAEmbeddingDataset(Dataset):
@@ -46,8 +114,8 @@ class DNAEmbeddingDataset(Dataset):
         assert max_samples is None or max_samples > 0, "max_samples must be positive or None"
 
         self.h5_file = h5_file
-        self.embeddings = h5_file["embeddings"]
-        self.sequences = h5_file["sequences"]
+        self.num_rows = len(h5_file["embeddings"])
+        self._reader = _LazyH5Reader(h5_file.filename)
         self.embedding_dim = embedding_dim
         self.seq_length = seq_length
         self.normalization_stats = normalization_stats
@@ -56,14 +124,14 @@ class DNAEmbeddingDataset(Dataset):
         self.tokenizer = tokenizer
 
     def __len__(self) -> int:  # noqa: D401
-        total_len = len(self.embeddings)
         if self.max_samples is not None:
-            return min(total_len, self.max_samples)
-        return total_len
+            return min(self.num_rows, self.max_samples)
+        return self.num_rows
 
     def __getitem__(self, idx: int):  # noqa: D401
         # Load embedding from disk on-the-fly (HDF5 handles memory mapping)
-        emb_flat = np.asarray(self.embeddings[idx], dtype=np.float32)
+        embeddings, sequences = self._reader.datasets()
+        emb_flat = np.asarray(embeddings[idx], dtype=np.float32)
 
         # Reshape from flattened array back to 2D [seq_length, embedding_dim]
         seq_length = len(emb_flat) // self.embedding_dim
@@ -84,7 +152,7 @@ class DNAEmbeddingDataset(Dataset):
                 )
 
         # Decode sequence from bytes and tokenize on-the-fly
-        seq_bytes = self.sequences[idx]
+        seq_bytes = sequences[idx]
         seq_str = seq_bytes.decode("utf-8") if isinstance(seq_bytes, bytes) else str(seq_bytes)
 
         seq_indices = self.tokenizer.encode(seq_str)
@@ -131,8 +199,8 @@ class DNAMeanEmbeddingDataset(Dataset):
         assert max_samples is None or max_samples > 0, "max_samples must be positive or None"
 
         self.h5_file = h5_file
-        self.embeddings = h5_file["embeddings"]
-        self.sequences = h5_file["sequences"]
+        self.num_rows = len(h5_file["embeddings"])
+        self._reader = _LazyH5Reader(h5_file.filename)
         self.embedding_dim = embedding_dim
         self.seq_length = seq_length
         self.normalization_stats = normalization_stats
@@ -142,14 +210,14 @@ class DNAMeanEmbeddingDataset(Dataset):
         self.tokenizer = tokenizer
 
     def __len__(self) -> int:  # noqa: D401
-        total_len = len(self.embeddings)
         if self.max_samples is not None:
-            return min(total_len, self.max_samples)
-        return total_len
+            return min(self.num_rows, self.max_samples)
+        return self.num_rows
 
     def __getitem__(self, idx: int):  # noqa: D401
         # Load embedding from disk on-the-fly (HDF5 handles memory mapping)
-        emb_flat = np.asarray(self.embeddings[idx], dtype=np.float32)
+        embeddings, sequences = self._reader.datasets()
+        emb_flat = np.asarray(embeddings[idx], dtype=np.float32)
 
         if self.data_is_precomputed:
             # Embeddings are already mean-pooled - just validate shape
@@ -180,7 +248,7 @@ class DNAMeanEmbeddingDataset(Dataset):
                 )
 
         # Decode sequence from bytes and tokenize on-the-fly
-        seq_bytes = self.sequences[idx]
+        seq_bytes = sequences[idx]
         seq_str = seq_bytes.decode("utf-8") if isinstance(seq_bytes, bytes) else str(seq_bytes)
 
         seq_indices = self.tokenizer.encode(seq_str)
@@ -189,10 +257,123 @@ class DNAMeanEmbeddingDataset(Dataset):
         if self.seq_length is not None:
             seq_indices = seq_indices[: self.seq_length]
 
+        # Append EOS so the model learns where the sequence ends. In multi-length
+        # training the EOS position is the only signal that distinguishes a
+        # length-15 target from a length-100 one (both share the same mean embedding shape).
+        eos = torch.tensor([self.tokenizer.eos_id], dtype=torch.long)
+        seq_indices = torch.cat([seq_indices, eos], dim=0)
+
         # Convert to torch tensors
         emb_tensor = torch.from_numpy(emb_mean).float()
         # seq_indices is already a LongTensor from tokenizer
         return emb_tensor, seq_indices
+
+
+def max_target_length(
+    files: List[h5py.File],
+    seq_lengths: List[int],
+    tokenizer: BaseTokenizer,
+    chunk_size: int = 100_000,
+) -> int:
+    """Longest target the datasets built over ``files`` can produce, in tokens.
+
+    Mirrors what ``__getitem__`` does to build a target -- tokenize, truncate to
+    the file's ``seq_length``, append EOS -- and returns the maximum over every
+    sequence, so a decoder of this width can represent all of them exactly.
+
+    Every sequence is scanned rather than a sample. The bound has to hold for
+    each individual target, and the token-length tail is far thinner than a
+    sample reveals: over the 3.9M real 100-mers of the hg38 training set the
+    DNABERT-2 tokenizer emits 29 tokens exactly once (28 twice, 27 for 24 of
+    them), while the first 20k rows top out at 25. A sampled bound plus fixed
+    headroom is therefore a coin flip on runs that last days; an exact pass over
+    the 31.6M-sequence multi-length set costs ~10-15 min (~35-70k sequences/sec,
+    slower when the per-FM runs scan concurrently) and cannot be wrong.
+
+    Scanning is also what keeps the width stable: it ignores ``subset_fraction``
+    and ``max_samples``, so a calibration run on 5% of the data builds the same
+    architecture as the full run, and a requeued job rebuilds the width its
+    checkpoint was saved with.
+    """
+    assert len(files) == len(seq_lengths), (
+        f"max_target_length mismatch: {len(files)} files vs {len(seq_lengths)} seq_lengths"
+    )
+    logger = logging.getLogger(__name__)
+
+    longest = 0
+    for h5, seq_len in zip(files, seq_lengths):
+        sequences = h5["sequences"]
+        file_longest = 0
+        for start in range(0, len(sequences), chunk_size):
+            chunk = [
+                s.decode("utf-8") if isinstance(s, bytes) else str(s)
+                for s in sequences[start : start + chunk_size]
+            ]
+            for n_tokens in tokenizer.token_lengths(chunk):
+                # +1 for the EOS the dataset appends after truncating to seq_len.
+                target_len = min(n_tokens, seq_len) + 1
+                file_longest = max(file_longest, target_len)
+        logger.info(
+            f"Scanned {len(sequences)} sequences of length {seq_len} in "
+            f"{os.path.basename(h5.filename)}: longest target = {file_longest} tokens"
+        )
+        longest = max(longest, file_longest)
+
+    assert longest > 0, "Scanned no sequences while sizing the decoder"
+    return longest
+
+
+def _validate_embedding_input_attrs(
+    h5_file: h5py.File, *, expected_digest: str, expected_length: int
+) -> None:
+    """Verify that a release embedding shard is bound to its source group."""
+    assert bool(h5_file.attrs.get("generation_complete", False)), (
+        f"Embedding file is incomplete: {h5_file.filename}"
+    )
+    assert int(h5_file.attrs["seq_length"]) == expected_length
+    assert str(h5_file.attrs["input_sequence_sha256"]) == expected_digest, (
+        f"Embedding/source provenance mismatch: {h5_file.filename}"
+    )
+
+
+def _validate_multilen_release_source(
+    cfg: DictConfig, data_dict: Dict[str, List[h5py.File]]
+) -> None:
+    """Validate v2 source invariants and every per-length embedding binding."""
+    if not bool(cfg.get("require_sequence_disjoint", False)):
+        return
+    source_path = hy_utils.to_absolute_path(cfg.source_corpus)
+    with h5py.File(source_path, "r", swmr=True) as source:
+        assert str(source.attrs["schema"]) == str(cfg.source_schema)
+        assert bool(source.attrs["generation_complete"])
+        assert bool(source.attrs["sequence_content_unique_per_length"])
+        assert bool(source.attrs["sequence_content_split_disjoint"])
+        split_lengths = {
+            "train": list(cfg.train_seq_lengths),
+            "val": list(cfg.seq_lengths),
+            "test": list(cfg.seq_lengths),
+        }
+        val_size = int(source.attrs["val_size_per_length"])
+        test_size = int(source.attrs["test_size_per_length"])
+        for split, files in data_dict.items():
+            for length, h5_file in zip(split_lengths[split], files, strict=True):
+                group = source[f"lengths/{int(length)}"]
+                expected_digest = str(group.attrs["ordered_sequence_sha256"])
+                _validate_embedding_input_attrs(
+                    h5_file,
+                    expected_digest=expected_digest,
+                    expected_length=int(length),
+                )
+                target = int(group.attrs["target_count"])
+                expected_rows = {
+                    "train": target - val_size - test_size,
+                    "val": val_size,
+                    "test": test_size,
+                }[split]
+                assert len(h5_file["sequences"]) == expected_rows, (
+                    f"Unexpected {split} size for length {length}: "
+                    f"{len(h5_file['sequences'])} != {expected_rows}"
+                )
 
 
 def load_split_embeddings(
@@ -285,6 +466,44 @@ def load_split_embeddings(
             train_stats["mean"] = to_scalar(h5_file.attrs["emb_mean"])
             train_stats["std"] = to_scalar(h5_file.attrs["emb_std"])
 
+    if bool(cfg.get("require_sequence_disjoint", False)):
+        source_path = hy_utils.to_absolute_path(cfg.source_corpus)
+        length = int(cfg.seq_length)
+        with h5py.File(source_path, "r", swmr=True) as source:
+            assert str(source.attrs["schema"]) == str(cfg.source_schema)
+            assert bool(source.attrs["sequence_content_split_disjoint"])
+            expected_digest = str(
+                source[f"lengths/{length}"].attrs["ordered_sequence_sha256"]
+            )
+        for split in ("train", "val"):
+            _validate_embedding_input_attrs(
+                data_dict[split],
+                expected_digest=expected_digest,
+                expected_length=length,
+            )
+        if "1000g" not in os.path.basename(data_dict["test"].filename):
+            _validate_embedding_input_attrs(
+                data_dict["test"],
+                expected_digest=expected_digest,
+                expected_length=length,
+            )
+        else:
+            ood_source_path = hy_utils.to_absolute_path(cfg.ood_source_corpus)
+            with h5py.File(ood_source_path, "r", swmr=True) as ood_source:
+                assert str(ood_source.attrs["schema"]) == (
+                    "dna_inversion_1000g_multilen_v2"
+                )
+                ood_digest = str(
+                    ood_source[f"lengths/{length}"].attrs[
+                        "ordered_sequence_sha256"
+                    ]
+                )
+            _validate_embedding_input_attrs(
+                data_dict["test"],
+                expected_digest=ood_digest,
+                expected_length=length,
+            )
+
     return data_dict, counts_dict, train_stats
 
 
@@ -374,3 +593,126 @@ def create_dataset(
         )
 
     return dataset
+
+
+def load_multi_split_embeddings(
+    cfg: DictConfig,
+) -> Tuple[Dict[str, List[h5py.File]], Dict[str, int], Dict[str, float]]:
+    """Load multiple per-length HDF5 files for multi-length training/eval.
+
+    Expects ``cfg`` to contain ``train_csvs``, ``val_csvs``, ``test_csvs`` (lists of paths)
+    and ``seq_lengths`` (list of the corresponding sequence lengths, same order).
+
+    ``val_csvs``/``test_csvs`` align 1:1 with ``seq_lengths`` (one file per length).
+    ``train_csvs`` may instead carry EXTRA per-length shards appended after the
+    base files (to add training data only at chosen lengths without re-embedding
+    the existing data); its per-entry lengths are then given by
+    ``train_seq_lengths``. The base train files must stay at indices
+    0..len(seq_lengths)-1 so per-length eval (which indexes ``train_csvs`` by the
+    position of a length in ``seq_lengths``) keeps pointing at the right file.
+
+    Training normalization statistics are pooled across all training files using
+    the sample-count-weighted mean and the pooled variance formula
+    ``var = sum_i n_i (sigma_i^2 + (mu_i - mu)^2) / sum_i n_i``.
+
+    Returns
+    -------
+    Tuple[Dict[str, List[h5py.File]], Dict[str, int], Dict[str, float]]
+        data_dict: per-split lists of HDF5 file handles, aligned with the matching
+        per-split lengths (train -> train_seq_lengths, val/test -> seq_lengths).
+        counts_dict: total sample counts per split (summed across files).
+        train_stats: pooled training statistics with keys 'min', 'max', 'mean', 'std'.
+    """
+    seq_lengths = list(cfg.seq_lengths)
+    assert len(seq_lengths) > 0, "Multi mode requires non-empty seq_lengths"
+    # Train shards may include extra per-length data beyond the base set; their
+    # lengths are listed in train_seq_lengths (which equals seq_lengths when no
+    # extra shards are configured).
+    train_seq_lengths = list(cfg.train_seq_lengths)
+
+    data_dict: Dict[str, List[h5py.File]] = {}
+    counts_dict: Dict[str, int] = {}
+
+    split_lengths = {
+        "train": train_seq_lengths,
+        "val": seq_lengths,
+        "test": seq_lengths,
+    }
+    for split in ["train", "val", "test"]:
+        csvs_key = f"{split}_csvs"
+        paths = list(cfg[csvs_key])
+        expected_lengths = split_lengths[split]
+        assert len(paths) == len(expected_lengths), (
+            f"Length mismatch in multi cfg: {csvs_key} has {len(paths)} entries "
+            f"but the matching length list has {len(expected_lengths)}"
+        )
+
+        files: List[h5py.File] = []
+        total = 0
+        for csv_path in paths:
+            path = hy_utils.to_absolute_path(csv_path)
+            assert path.endswith(".h5") or path.endswith(
+                ".hdf5"
+            ), f"Expected HDF5 file for {split}, got {path}"
+
+            h5_file = h5py.File(path, "r", swmr=True)
+            assert "sequences" in h5_file, f"Key 'sequences' missing in {path}"
+            assert "embeddings" in h5_file, f"Key 'embeddings' missing in {path}"
+
+            first_emb_flat = np.asarray(h5_file["embeddings"][0], dtype=np.float32)
+            assert first_emb_flat.ndim == 1, f"Expected 1D embedding array in {path}"
+            if cfg.mean:
+                assert len(first_emb_flat) == cfg.embedding_dim, (
+                    f"Expected mean embedding of length {cfg.embedding_dim} in {path}, "
+                    f"got {len(first_emb_flat)}"
+                )
+
+            files.append(h5_file)
+            total += len(h5_file["embeddings"])
+
+        data_dict[split] = files
+        counts_dict[split] = total
+
+    train_stats = compute_pooled_train_stats(data_dict["train"])
+    _validate_multilen_release_source(cfg, data_dict)
+
+    return data_dict, counts_dict, train_stats
+
+
+def create_multi_dataset(
+    data_files: List[h5py.File],
+    seq_lengths: List[int],
+    mode: str,
+    tokenizer: BaseTokenizer,
+    embedding_dim: int,
+    normalization_stats: Dict[str, float] | None = None,
+    normalization_method: str = "standard",
+    data_is_mean: bool = False,
+    subset_fraction: float | None = None,
+    max_samples: int | None = None,
+) -> Dataset:
+    """Concatenate per-length datasets into a single multi-length dataset.
+
+    All datasets share the same tokenizer, embedding_dim, and normalization
+    statistics. Each sub-dataset is built with its own ``seq_length`` so
+    sequences/embeddings are truncated/tokenized correctly per file.
+    """
+    assert len(data_files) == len(seq_lengths), (
+        f"Multi dataset mismatch: {len(data_files)} files vs {len(seq_lengths)} seq_lengths"
+    )
+    sub_datasets = []
+    for h5, seq_len in zip(data_files, seq_lengths):
+        ds = create_dataset(
+            data=h5,
+            mode=mode,
+            tokenizer=tokenizer,
+            embedding_dim=embedding_dim,
+            seq_length=seq_len,
+            normalization_stats=normalization_stats,
+            normalization_method=normalization_method,
+            data_is_mean=data_is_mean,
+            subset_fraction=subset_fraction,
+            max_samples=max_samples,
+        )
+        sub_datasets.append(ds)
+    return ConcatDataset(sub_datasets)

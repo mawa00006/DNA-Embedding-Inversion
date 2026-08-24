@@ -5,7 +5,8 @@ defaults:
 
 layer_name: blocks.26.mlp.l3
 checkpoint: evo2_7b
-update_config: conf/data/evo2_${seq_length}_hg38.yaml
-train_output_path: data/train_evo2_deep_${seq_length}_hg38_per_token.h5
-val_output_path: data/val_evo2_deep_${seq_length}_hg38_per_token.h5
-test_output_path: data/test_evo2_deep_${seq_length}_hg38_per_token.h5
+batch_size: 8
+update_config: conf/data/hg38/evo2_${seq_length}_hg38.yaml
+train_output_path: data/hg38/train_evo2_${seq_length}_hg38_per_token.h5
+val_output_path: data/hg38/val_evo2_${seq_length}_hg38_per_token.h5
+test_output_path: data/hg38/test_evo2_${seq_length}_hg38_per_token.h5

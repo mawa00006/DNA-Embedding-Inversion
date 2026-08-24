@@ -5,22 +5,42 @@
 ###############################################
 
 defaults:
-  - data: dnabert2_100_hg38_per_token
-  - model: mlp_per_token
+  - data: hg38_multilen_seqdisjoint/dnabert2_multi_hg38_multilen_seqdisjoint_mean
+  - model: query_decoder
   - _self_
 
 
 optim:
   lr: 1e-3
   weight_decay: 1e-4
-  epochs: 70
+  # AdamW epsilon. Raised from the 1e-8 default: with a tiny second-moment
+  # estimate the update ~ grad / (sqrt(v) + eps) can blow up, and the evo2
+  # query_decoder diverged to NaN near the OneCycle LR peak in fp32. 1e-6 floors
+  # the denominator and is a standard transformer-stability value.
+  eps: 1e-6
+  # Default budget for a bare `python train.py`. The benchmark pipeline overrides
+  # this in run_experiments_multilen.sh (query_decoder = MULTI_EPOCHS) so the
+  # OneCycle anneal completes within the budget.
+  epochs: 15
   batch_size: 32
-  num_workers: 0 
-  
+
+
+  num_workers: 16
+
+  # Global gradient-norm clipping. The OneCycle schedule peaks at max_lr around
+  # pct_start*total_steps; without clipping the transformer decoders diverged
+  # there (loss 5 -> 1000s) and wasted the rest of the budget recovering. 1.0 is
+  # the standard transformer value; set to 0 to disable.
+  grad_clip_norm: 1.0
+
   # Learning rate scheduler configuration
   use_scheduler: true  # Enable/disable OneCycleLR scheduler
   scheduler:
-    max_lr: 1e-3  # Maximum learning rate (peak of the cycle)
+    # Lowered from 1e-3: the divergence happened at the OneCycle peak, and 5e-4
+    # keeps the peak below the instability threshold. NOTE: this is shared across
+    # FMs, so an in-flight run that resumes will follow the new (lower) peak from
+    # that point on -- cleanest when applied at a fresh full restart.
+    max_lr: 5e-4  # Maximum learning rate (peak of the cycle)
     pct_start: 0.3  # Percentage of cycle spent increasing learning rate
     anneal_strategy: cos  # 'cos' or 'linear' annealing
     div_factor: 25.0  # Initial_lr = max_lr / div_factor
@@ -31,17 +51,33 @@ train:
   project: dna-embedding-inversion
   run_name: null
   use_wandb: false
-  log_interval: 30
+  log_interval: 10000
   device: cuda:0
-  
-  # Early stopping configuration
+
+  # Early stopping configuration.
+  # IMPORTANT: must be disabled while optim.use_scheduler (OneCycleLR) is on.
+  # OneCycle is a fixed-horizon schedule whose total_steps is sized to the full
+  # epoch budget; stopping early leaves the LR un-annealed (near its peak), so
+  # the model never reaches the low-LR phase where it converges. train.py
+  # asserts this. Best-val checkpointing in fit() still keeps the best epoch.
   early_stopping:
-    enabled: true
-    patience: 10  # Number of epochs to wait for improvement
+    enabled: false
+    patience: 5  # Number of epochs to wait for improvement
     min_delta: 1e-5  # Minimum change to qualify as improvement
 
   # Maximum number of validation samples (null = all)
   max_val_samples: null
+
+  # Adaptive stabiliser for divergence the per-batch NaN skip alone cannot tame.
+  # If a non-improving epoch skipped more than skip_frac_threshold of its batches
+  # (non-finite loss/grad -- a sign the LR is too high for the current state), the
+  # model is rolled back to the last good (best) weights and the effective LR is
+  # multiplied by lr_backoff for the rest of training. Each trigger multiplies
+  # again, so the LR keeps dropping until training stabilises (loop-safe). Set
+  # lr_backoff=1.0 to keep the rollback but disable the LR reduction.
+  nan_backoff:
+    skip_frac_threshold: 0.02
+    lr_backoff: 0.5
 
 hydra:
   run:

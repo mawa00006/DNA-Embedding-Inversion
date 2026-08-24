@@ -4,7 +4,7 @@ defaults:
   - _self_
 
 checkpoint: zhihan1996/DNABERT-2-117M
-update_config: conf/data/dnabert2_${seq_length}_hg38.yaml
-train_output_path: data/train_dnabert2_${seq_length}_hg38_per_token.h5
-val_output_path: data/val_dnabert2_${seq_length}_hg38_per_token.h5
-test_output_path: data/test_dnabert2_${seq_length}_hg38_per_token.h5
+update_config: conf/data/hg38/dnabert2_${seq_length}_hg38.yaml
+train_output_path: data/hg38/train_dnabert2_${seq_length}_hg38_per_token.h5
+val_output_path: data/hg38/val_dnabert2_${seq_length}_hg38_per_token.h5
+test_output_path: data/hg38/test_dnabert2_${seq_length}_hg38_per_token.h5

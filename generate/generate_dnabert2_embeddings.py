@@ -32,7 +32,34 @@ from transformers import AutoTokenizer, AutoModel, BertConfig
 # Add parent directory to path to import src module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.utils import file_sha256, set_determinism, load_sequences_from_file, update_yaml_keys
+from src.utils import (
+    file_sha256,
+    set_determinism,
+    load_sequences_from_file,
+    load_identification_csv,
+    update_yaml_keys,
+)
+from src.generation_io import run_generation
+
+
+def _write_identification_metadata(
+    h5_file: h5py.File,
+    split_indices: np.ndarray,
+    individual_ids: List[str],
+    locus_ids: List[int],
+    haplotypes: List[int],
+) -> None:
+    """Write per-row identification labels into an H5 file (aligned with sequences/embeddings)."""
+    dt_str = h5py.string_dtype(encoding="utf-8")
+    n = len(split_indices)
+    ind_ds = h5_file.create_dataset("individual_ids", (n,), dtype=dt_str)
+    loc_ds = h5_file.create_dataset("locus_ids", (n,), dtype=np.int32)
+    hap_ds = h5_file.create_dataset("haplotypes", (n,), dtype=np.int8)
+    for i, src_idx in enumerate(split_indices):
+        ind_ds[i] = individual_ids[src_idx]
+        loc_ds[i] = locus_ids[src_idx]
+        hap_ds[i] = haplotypes[src_idx]
+    h5_file.attrs["identification_mode"] = True
 
 
 def _patch_triton_flash_attn():
@@ -100,25 +127,8 @@ def embed_sequence_dnabert(
     return token_embs
 
 
-def generate_embeddings_dnabert(
-    sequences: List[str], checkpoint: str, device: str
-) -> List[np.ndarray]:
-    """Generate DNABERT-2 embeddings for multiple sequences.
-
-    Parameters
-    ----------
-    sequences : List[str]
-        List of DNA sequences.
-    checkpoint : str
-        DNABERT-2 model checkpoint (Hugging Face style).
-    device : str
-        Device to place input tensors on.
-
-    Returns
-    -------
-    List[np.ndarray]
-        List of per-nucleotide embeddings.
-    """
+def _load_dnabert(checkpoint: str, device: str):
+    """Load the DNABERT-2 tokenizer + model (with the Triton flash-attn patch)."""
     logger = logging.getLogger(__name__)
     logger.info(f"Loading DNABERT-2 tokenizer and model from: {checkpoint}")
 
@@ -136,12 +146,41 @@ def generate_embeddings_dnabert(
 
     model.to(device)
     model.eval()
-
     logger.info(f"DNABERT-2 model {checkpoint} loaded successfully")
+    return tokenizer, model
+
+
+def _make_embed_chunk_dnabert(checkpoint: str, device: str):
+    """Load the model and return ``embed_chunk``: sequences -> mean-pooled ``[D]`` arrays.
+
+    Reuses ``embed_sequence_dnabert``; the model is loaded once.
+    """
+    tokenizer, model = _load_dnabert(checkpoint, device)
+
+    def embed_chunk(seqs: List[str]) -> List[np.ndarray]:
+        return [embed_sequence_dnabert(tokenizer, model, s, device).mean(axis=0) for s in seqs]
+
+    return embed_chunk
+
+
+def generate_embeddings_dnabert(
+    sequences: List[str], checkpoint: str, device: str, mean_pool: bool = False
+) -> List[np.ndarray]:
+    """Generate DNABERT-2 embeddings for multiple sequences.
+
+    When ``mean_pool=True``, each per-sequence ``[num_tokens, D]`` embedding is
+    reduced to ``[D]`` before being appended to the result list. This bounds the
+    host RAM at ``N*D`` instead of ``N*num_tokens*D``.
+    """
+    logger = logging.getLogger(__name__)
+    tokenizer, model = _load_dnabert(checkpoint, device)
+    logger.info(f"mean_pool={mean_pool}")
 
     embeddings = []
     for i, seq in enumerate(sequences):
         emb = embed_sequence_dnabert(tokenizer, model, seq, device)
+        if mean_pool:
+            emb = emb.mean(axis=0)
         embeddings.append(emb)
 
         if (i + 1) % 100 == 0:
@@ -165,31 +204,49 @@ def main(cfg: DictConfig) -> None:
     set_determinism(int(cfg.seed))
 
     # Load sequences from file or generate random ones
-    input_path = cfg.get("input_path", None)
-
-    if input_path is None:
-        raise ValueError("input_path must be provided in the configuration.")
+    assert cfg.input_path is not None, "input_path must be provided in the configuration."
+    input_path = cfg.input_path
 
     input_path = hy_utils.to_absolute_path(input_path)
     logger.info(f"Loading sequences from file: {input_path}")
-    logger.info(f"Max sequences (num_sequences): {cfg.num_sequences}")
-    # Note: seq_length here acts as a filter/truncator for loaded sequences
-    logger.info(f"Max sequence length (seq_length): {cfg.seq_length}")
-    sequences = load_sequences_from_file(
-        input_path, max_length=cfg.seq_length, max_sequences=cfg.num_sequences
-    )
+    identification_mode = cfg.identification_mode
 
-    # Remove duplicate sequences
-    original_count = len(sequences)
-    sequences = list(dict.fromkeys(sequences))
-    duplicates_removed = original_count - len(sequences)
+    if identification_mode:
+        logger.info(f"Loading identification CSV (preserving order, no dedup): {input_path}")
+        id_data = load_identification_csv(input_path)
+        sequences = id_data["sequences"]
+        individual_ids = id_data["individual_ids"]
+        locus_ids = id_data["locus_ids"]
+        haplotypes = id_data["haplotypes"]
+        assert all(len(s) == cfg.seq_length for s in sequences), (
+            "Identification CSV contains sequences not matching cfg.seq_length"
+        )
+        logger.info(
+            f"Loaded {len(sequences)} identification rows "
+            f"({len(set(individual_ids))} individuals, {len(set(locus_ids))} loci)"
+        )
+    else:
+        logger.info(f"Max sequences (num_sequences): {cfg.num_sequences}")
+        # Note: seq_length here acts as a filter/truncator for loaded sequences
+        logger.info(f"Max sequence length (seq_length): {cfg.seq_length}")
+        sequences = load_sequences_from_file(
+            input_path, max_length=cfg.seq_length, max_sequences=cfg.num_sequences
+        )
+        individual_ids = None
+        locus_ids = None
+        haplotypes = None
 
-    if duplicates_removed > 0:
-        logger.warning(f"Removed {duplicates_removed} duplicate sequences")
+        if bool(cfg.get("deduplicate_sequences", True)):
+            original_count = len(sequences)
+            sequences = list(dict.fromkeys(sequences))
+            duplicates_removed = original_count - len(sequences)
+            if duplicates_removed > 0:
+                logger.warning(f"Removed {duplicates_removed} duplicate sequences")
 
-    logger.info(
-        f"Loaded {len(sequences)} unique sequences from file (limited to {cfg.num_sequences}, truncated to {cfg.seq_length} if needed)"
-    )
+        logger.info(
+            f"Loaded {len(sequences)} sequence windows from file "
+            f"(limited to {cfg.num_sequences}, target length {cfg.seq_length})"
+        )
 
     # Extract embeddings
     checkpoint = cfg.checkpoint
@@ -200,22 +257,32 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Using device: {device}")
     logger.info(f"{'=' * 80}")
 
-    embeddings = generate_embeddings_dnabert(sequences, checkpoint, device)
+    # Resumable, incremental generation for the mean-split and identification
+    # paths (handles fast-exit on complete output and resume on partial). Returns
+    # False only for the legacy all-at-once per-token (mean=false) case.
+    if run_generation(
+        cfg,
+        sequences=sequences,
+        individual_ids=individual_ids,
+        locus_ids=locus_ids,
+        haplotypes=haplotypes,
+        make_embed_chunk=lambda: _make_embed_chunk_dnabert(checkpoint, device),
+        logger=logger,
+    ):
+        return
 
-    # Split data into train, val, test
-    eval_only = cfg.get("eval_only", False)
-    if eval_only:
-        train_split = 0.0
-        val_split = 0.0
-        test_split = 1.0
-    else:
-        train_split = cfg.train_split
-        val_split = cfg.val_split
-        test_split = 1.0 - train_split - val_split
+    use_mean = bool(cfg.mean)
+    embeddings = generate_embeddings_dnabert(sequences, checkpoint, device, mean_pool=use_mean)
 
-        assert (
-            train_split + val_split + test_split > 0.99
-        ), "Split ratios must sum to approximately 1.0"
+    # Split data into train, val, test. The mean and identification paths are
+    # handled resumably in run_generation above, so this legacy all-at-once path is
+    # only ever reached for the per-token (mean=false) track -- always a full split.
+    train_split = cfg.train_split
+    val_split = cfg.val_split
+    test_split = 1.0 - train_split - val_split
+    assert (
+        train_split + val_split + test_split > 0.99
+    ), "Split ratios must sum to approximately 1.0"
 
     n = len(sequences)
     train_n = int(n * train_split)
@@ -223,7 +290,8 @@ def main(cfg: DictConfig) -> None:
 
     # Create indices and split
     indices = np.arange(n)
-    np.random.shuffle(indices)
+    if not identification_mode:
+        np.random.shuffle(indices)
 
     train_idx = indices[:train_n]
     val_idx = indices[train_n : train_n + val_n]
@@ -232,52 +300,41 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Split sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
     # Save each split to HDF5
-    if eval_only:
-        splits = {"test": test_idx}
+    splits = {
+        "train": train_idx,
+        "val": val_idx,
+        "test": test_idx,
+    }
+
+    # Note: when use_mean=True, each `embeddings[i]` is already shape [D] (pooled
+    # inside the generation loop to bound host RAM); otherwise it is [num_tokens, D].
+
+    # Compute global statistics from TRAINING SET only
+    train_sequences = [sequences[i] for i in splits["train"]]
+    train_embeddings = [embeddings[i] for i in splits["train"]]
+
+    if use_mean:
+        logger.info("Computing global statistics from training set (mean-pooled embeddings)...")
+        all_train_values = np.concatenate([emb.ravel() for emb in train_embeddings])
+        embedding_dim = train_embeddings[0].shape[-1]
     else:
-        splits = {
-            "train": train_idx,
-            "val": val_idx,
-            "test": test_idx,
-        }
+        logger.info(
+            "Computing global statistics from training set (per-nucleotide embeddings)..."
+        )
+        all_train_values = np.concatenate([emb.flatten() for emb in train_embeddings])
+        embedding_dim = train_embeddings[0].shape[1]
 
-    use_mean = cfg.get("mean", False)
+    # Compute global scalar statistics (not per-dimension)
+    global_min = float(np.min(all_train_values))
+    global_max = float(np.max(all_train_values))
+    global_mean = float(np.mean(all_train_values))
+    global_std = float(np.std(all_train_values))
 
-    if eval_only:
-        global_min, global_max, global_mean, global_std = 0.0, 0.0, 0.0, 0.0
-        embedding_dim = embeddings[0].shape[1] if embeddings else 0
-        logger.info("Skipping global statistics computation because eval_only mode is on.")
-    else:
-        # Compute global statistics from TRAINING SET only
-        train_sequences = [sequences[i] for i in splits["train"]]
-        train_embeddings = [embeddings[i] for i in splits["train"]]
-
-        if use_mean:
-            logger.info("Computing global statistics from training set (mean-pooled embeddings)...")
-            # Compute mean pooling for training embeddings
-            train_mean_embeddings = [np.mean(emb, axis=0) for emb in train_embeddings]
-            # Compute global statistics across ALL values in the training set
-            all_train_values = np.concatenate([emb.flatten() for emb in train_mean_embeddings])
-            embedding_dim = train_embeddings[0].shape[1]
-        else:
-            logger.info(
-                "Computing global statistics from training set (per-nucleotide embeddings)..."
-            )
-            # Compute global statistics across ALL values in the training set
-            all_train_values = np.concatenate([emb.flatten() for emb in train_embeddings])
-            embedding_dim = train_embeddings[0].shape[1]
-
-        # Compute global scalar statistics (not per-dimension)
-        global_min = float(np.min(all_train_values))
-        global_max = float(np.max(all_train_values))
-        global_mean = float(np.mean(all_train_values))
-        global_std = float(np.std(all_train_values))
-
-        logger.info("Global statistics from training set:")
-        logger.info(f"  min:  {global_min:.6f}")
-        logger.info(f"  max:  {global_max:.6f}")
-        logger.info(f"  mean: {global_mean:.6f}")
-        logger.info(f"  std:  {global_std:.6f}")
+    logger.info("Global statistics from training set:")
+    logger.info(f"  min:  {global_min:.6f}")
+    logger.info(f"  max:  {global_max:.6f}")
+    logger.info(f"  mean: {global_mean:.6f}")
+    logger.info(f"  std:  {global_std:.6f}")
 
     hashes = {}
 
@@ -289,8 +346,8 @@ def main(cfg: DictConfig) -> None:
 
         if use_mean:
             logger.info(f"Saving mean-pooled embeddings for {split_name} split")
-            # Compute mean pooling for each embedding in this split
-            mean_embeddings = [np.mean(emb, axis=0) for emb in split_embeddings]
+            # Embeddings were mean-pooled inside the generation loop; each is [D].
+            mean_embeddings = split_embeddings
 
             with h5py.File(output_path, "w") as f:
                 dt_str = h5py.string_dtype(encoding="utf-8")
@@ -304,6 +361,11 @@ def main(cfg: DictConfig) -> None:
                 )
                 for i, emb_mean in enumerate(mean_embeddings):
                     emb_dataset[i] = emb_mean
+
+                if identification_mode:
+                    _write_identification_metadata(
+                        f, split_indices, individual_ids, locus_ids, haplotypes
+                    )
 
                 # Store metadata as attributes
                 f.attrs["embedding_dim"] = embedding_dim
@@ -336,6 +398,11 @@ def main(cfg: DictConfig) -> None:
                 for i, emb in enumerate(split_embeddings):
                     emb_dataset[i] = emb.flatten()
 
+                if identification_mode:
+                    _write_identification_metadata(
+                        f, split_indices, individual_ids, locus_ids, haplotypes
+                    )
+
                 # Store shape metadata as attributes
                 f.attrs["embedding_dim"] = embedding_dim
                 f.attrs["checkpoint"] = checkpoint
@@ -364,19 +431,17 @@ def main(cfg: DictConfig) -> None:
             "embedding_dim": embedding_dim,
             "seq_length": cfg.seq_length,
         }
-        if not eval_only:
-            updates["train_sha256"] = hashes["train"]
-            updates["val_sha256"] = hashes["val"]
-            updates["train_csv"] = cfg.train_output_path
-            updates["val_csv"] = cfg.val_output_path
+        updates["train_sha256"] = hashes["train"]
+        updates["val_sha256"] = hashes["val"]
+        updates["train_csv"] = cfg.train_output_path
+        updates["val_csv"] = cfg.val_output_path
 
         update_yaml_keys(str(config_path), updates)
         logger.info("Config file updated.")
     else:
         print(f"Update conf/config.yaml data section:")
-        if not eval_only:
-            print(f"train_sha256: {hashes['train']}")
-            print(f"val_sha256: {hashes['val']}")
+        print(f"train_sha256: {hashes['train']}")
+        print(f"val_sha256: {hashes['val']}")
         print(f"test_sha256: {hashes['test']}")
 
 

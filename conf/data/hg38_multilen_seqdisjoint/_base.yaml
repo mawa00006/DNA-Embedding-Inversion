@@ -1,0 +1,60 @@
+shuffle: true
+mean: true
+multi: true
+require_sequence_disjoint: true
+source_schema: dna_inversion_hg38_multilen_v2
+source_corpus: data/hg38_multilen_seqdisjoint/hg38_multilen_seqdisjoint.h5
+ood_source_corpus: data/1000g_multilen_seqdisjoint/1000g_multilen_seqdisjoint.h5
+artifact_dir: data/hg38_multilen_seqdisjoint
+fm_slug: null
+seq_lengths: &lengths [10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100]
+train_seq_lengths: *lengths
+train_csvs:
+  - ${data.artifact_dir}/train_${data.fm_slug}_10_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_15_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_20_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_25_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_30_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_35_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_40_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_45_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_50_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_60_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_70_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_80_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_90_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/train_${data.fm_slug}_100_hg38_multilen_seqdisjoint.h5
+val_csvs:
+  - ${data.artifact_dir}/val_${data.fm_slug}_10_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_15_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_20_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_25_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_30_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_35_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_40_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_45_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_50_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_60_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_70_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_80_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_90_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/val_${data.fm_slug}_100_hg38_multilen_seqdisjoint.h5
+test_csvs:
+  - ${data.artifact_dir}/test_${data.fm_slug}_10_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_15_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_20_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_25_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_30_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_35_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_40_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_45_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_50_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_60_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_70_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_80_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_90_hg38_multilen_seqdisjoint.h5
+  - ${data.artifact_dir}/test_${data.fm_slug}_100_hg38_multilen_seqdisjoint.h5
+seq_length: 100
+skip_sha256_check: true
+normalization_method: standard
+subset_fraction: null

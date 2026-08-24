@@ -174,6 +174,7 @@ def reconstruct_sequences(
     normalization_stats: Dict[str, float] | None = None,
     normalization_method: str = "standard",
     data_is_mean: bool = False,
+    inference_batch_size: int = 256,
 ) -> List[str]:
     """Reconstruct DNA sequences from embeddings using trained model.
 
@@ -189,9 +190,10 @@ def reconstruct_sequences(
     tokenizer : BaseTokenizer
         Tokenizer for decoding sequences.
     mode : str
-        Either "per_token", "mean", or "corrector".
+        Either "per_token" or "mean".
     seq_length : int | None
-        Sequence length to use. If specified, and sequence longer, embeddings will be truncated.
+        Optional number of input embedding positions retained for legacy
+        unpooled inputs. This never truncates the decoded output sequence.
     embedding_dim : int | None
         Embedding dimension needed for reshaping flattened arrays. Required when embeddings are 1D.
     normalization_stats : Dict[str, float] | None
@@ -200,6 +202,11 @@ def reconstruct_sequences(
         Normalization method: 'standard' (z-score) or 'minmax' (0-1 range).
     data_is_mean : bool
         If True, embeddings are pre-computed mean embeddings. If False, they are per-nucleotide.
+    inference_batch_size : int
+        Batch size for pre-computed mean embeddings. The legacy implementation
+        issued one GPU forward pass per sequence; batching is equivalent because
+        the reconstruction models are in evaluation mode and reduces evaluation
+        time by orders of magnitude for the large identification cohorts.
 
     Returns
     -------
@@ -209,7 +216,7 @@ def reconstruct_sequences(
     assert mode in [
         "per_token",
         "mean",
-    ], f"Invalid mode: {mode}. For corrector models, use eval_corrector.py"
+    ], f"Invalid mode: {mode}. Must be 'per_token' or 'mean'"
     assert normalization_method in [
         "standard",
         "minmax",
@@ -219,6 +226,40 @@ def reconstruct_sequences(
     reconstructed = []
 
     embeddings = data["embeddings"] if hasattr(data, "__getitem__") else data
+
+    # Fast path used by the publication's mean-pooled models. All vectors have
+    # the same width, so they can be normalized and decoded in batches without
+    # changing EOS handling or any reconstruction metric.
+    if mode == "mean" and data_is_mean:
+        assert embedding_dim is not None
+        assert inference_batch_size > 0
+        for start in range(0, len(embeddings), inference_batch_size):
+            end = min(start + inference_batch_size, len(embeddings))
+            batch = np.asarray(embeddings[start:end], dtype=np.float32)
+            if batch.ndim == 1:
+                batch = batch.reshape(1, -1)
+            assert batch.ndim == 2 and batch.shape[1] == embedding_dim, (
+                f"Expected [batch,{embedding_dim}] mean embeddings, got {batch.shape}"
+            )
+            if normalization_stats:
+                if normalization_method == "standard":
+                    batch = (batch - normalization_stats["mean"]) / normalization_stats["std"]
+                else:
+                    batch = (batch - normalization_stats["min"]) / (
+                        normalization_stats["max"] - normalization_stats["min"]
+                    )
+            batch_tensor = torch.from_numpy(batch).float().to(device)
+            if hasattr(model, "iterative_decode"):
+                indices_batch = model.iterative_decode(
+                    batch_tensor, eos_id=tokenizer.eos_id
+                ).cpu().numpy()
+            else:
+                pred = model(batch_tensor)
+                if isinstance(pred, tuple):
+                    pred = pred[0]
+                indices_batch = torch.argmax(pred, dim=-1).cpu().numpy()
+            reconstructed.extend(tokenizer.decode(indices) for indices in indices_batch)
+        return reconstructed
 
     for i in range(len(embeddings)):
         # Load embedding on-the-fly (memory efficient for memory-mapped arrays)
@@ -290,16 +331,29 @@ def reconstruct_sequences(
 
             emb_tensor = torch.from_numpy(emb).float().unsqueeze(0).to(device)
 
-        # Forward pass
-        pred = model(emb_tensor)
+        # Mask-Predict models refine their draft over several passes; everything
+        # else predicts in a single argmax pass. Both return token ids that the
+        # tokenizer decodes (stopping at the first EOS).
+        if hasattr(model, "iterative_decode"):
+            indices = model.iterative_decode(emb_tensor, eos_id=tokenizer.eos_id)
+            indices = indices.squeeze(0).cpu().numpy()
+        else:
+            # Forward pass. Some models (e.g. query_decoder) return a tuple of
+            # (seq_logits, length_logits); we only consume the sequence logits here
+            # since length is implicit in the EOS-terminated decoded string.
+            pred = model(emb_tensor)
+            if isinstance(pred, tuple):
+                pred = pred[0]
 
-        # Remove batch dimension and convert to numpy
-        pred_np = pred.squeeze(0).cpu().numpy()
+            # Remove batch dimension and convert to numpy
+            pred_np = pred.squeeze(0).cpu().numpy()
 
-        # Get indices
-        indices = np.argmax(pred_np, axis=-1)
+            # Get indices
+            indices = np.argmax(pred_np, axis=-1)
 
-        # Decode to sequence
+        # Decode through the first predicted EOS. Do not crop to seq_length or
+        # to the (unavailable) true length: over-long predictions must remain
+        # over-long so Levenshtein similarity penalises the insertion error.
         seq = tokenizer.decode(indices)
         reconstructed.append(seq)
 
@@ -454,37 +508,34 @@ def load_model_from_run(run_dir: str, device: torch.device):
     config = checkpoint["config"]
     mode = checkpoint["mode"]
 
-    # Check for corrector mode
-    if mode == "corrector":
-        from src.model.corrector import CorrectorReconstructor
+    # Load the model.py file from the run directory
+    model_py_path = os.path.join(run_dir, "model.py")
+    assert os.path.exists(model_py_path), f"model.py not found in {run_dir}"
 
-        ModelClass = CorrectorReconstructor
-        model_type = "corrector"  # Override for kwargs selection
+    # Dynamically import the model module
+    spec = importlib.util.spec_from_file_location("run_model", model_py_path)
+    assert spec is not None and spec.loader is not None
+    run_model_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(run_model_module)
+
+    model_type = config["model"]["model_type"]
+    if model_type == "encoder":
+        model_class_name = "EncoderReconstructor"
+    elif model_type == "decoder":
+        model_class_name = "DecoderReconstructor"
+    elif model_type == "knn":
+        model_class_name = "KNNReconstructor"
+    elif model_type == "resnet":
+        model_class_name = "ResNetReconstructor"
+    elif model_type == "query_decoder":
+        model_class_name = "QueryDecoderReconstructor"
+    elif model_type == "mask_predict":
+        model_class_name = "MaskPredictReconstructor"
     else:
-        # Load the model.py file from the run directory
-        model_py_path = os.path.join(run_dir, "model.py")
-        assert os.path.exists(model_py_path), f"model.py not found in {run_dir}"
-
-        # Dynamically import the model module
-        spec = importlib.util.spec_from_file_location("run_model", model_py_path)
-        assert spec is not None and spec.loader is not None
-        run_model_module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(run_model_module)
-
-        model_type = config["model"]["model_type"]
-        if model_type == "encoder":
-            model_class_name = "EncoderReconstructor"
-        elif model_type == "decoder":
-            model_class_name = "DecoderReconstructor"
-        elif model_type == "knn":
-            model_class_name = "KNNReconstructor"
-        elif model_type == "resnet":
-            model_class_name = "ResNetReconstructor"
-        else:
-            model_class_name = (
-                "SequenceMeanReconstructor" if mode == "mean" else "SequenceReconstructor"
-            )
-        ModelClass = getattr(run_model_module, model_class_name)
+        model_class_name = (
+            "SequenceMeanReconstructor" if mode == "mean" else "SequenceReconstructor"
+        )
+    ModelClass = getattr(run_model_module, model_class_name)
 
     output_dim = checkpoint["output_dim"]
     effective_seq_length = checkpoint.get("effective_seq_length", config["data"]["seq_length"])
@@ -529,13 +580,34 @@ def load_model_from_run(run_dir: str, device: torch.device):
             "kernel_size": config["model"]["kernel_size"],
             "dropout": config["model"]["dropout"],
         }
-    elif model_type == "corrector":
+    elif model_type == "query_decoder":
         model_kwargs = {
             "input_dim": checkpoint["input_dim"],
+            "mode": mode,
             "seq_length": effective_seq_length,
             "output_dim": output_dim,
             "d_model": config["model"]["d_model"],
+            "nhead": config["model"]["nhead"],
+            "num_layers": config["model"]["num_layers"],
+            "dim_feedforward": config["model"]["dim_feedforward"],
             "dropout": config["model"]["dropout"],
+            "n_context_tokens": config["model"]["n_context_tokens"],
+            "aux_length_loss_weight": config["model"]["aux_length_loss_weight"],
+        }
+    elif model_type == "mask_predict":
+        model_kwargs = {
+            "input_dim": checkpoint["input_dim"],
+            "mode": mode,
+            "seq_length": effective_seq_length,
+            "output_dim": output_dim,
+            "d_model": config["model"]["d_model"],
+            "nhead": config["model"]["nhead"],
+            "num_layers": config["model"]["num_layers"],
+            "dim_feedforward": config["model"]["dim_feedforward"],
+            "dropout": config["model"]["dropout"],
+            "n_context_tokens": config["model"]["n_context_tokens"],
+            "aux_length_loss_weight": config["model"]["aux_length_loss_weight"],
+            "num_iterations": config["model"]["num_iterations"],
         }
     elif mode == "mean":
         # Mean mode MLP calculates output_dim from seq_length * output_dim

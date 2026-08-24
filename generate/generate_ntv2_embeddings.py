@@ -36,26 +36,52 @@ from src.utils import (
     file_sha256,
     set_determinism,
     load_sequences_from_file,
+    load_identification_csv,
     update_yaml_keys,
 )
+from src.generation_io import mean_pool_in_batches, run_generation
 
 
-def embed_sequence_ntv2(
+def _write_identification_metadata(
+    h5_file: h5py.File,
+    split_indices: np.ndarray,
+    individual_ids: List[str],
+    locus_ids: List[int],
+    haplotypes: List[int],
+) -> None:
+    """Write per-row identification labels (individual_id/locus_id/haplotype) into an H5 file.
+
+    Datasets are aligned 1:1 with ``sequences`` and ``embeddings``.
+    """
+    dt_str = h5py.string_dtype(encoding="utf-8")
+    n = len(split_indices)
+    ind_ds = h5_file.create_dataset("individual_ids", (n,), dtype=dt_str)
+    loc_ds = h5_file.create_dataset("locus_ids", (n,), dtype=np.int32)
+    hap_ds = h5_file.create_dataset("haplotypes", (n,), dtype=np.int8)
+    for i, src_idx in enumerate(split_indices):
+        ind_ds[i] = individual_ids[src_idx]
+        loc_ds[i] = locus_ids[src_idx]
+        hap_ds[i] = haplotypes[src_idx]
+    h5_file.attrs["identification_mode"] = True
+
+
+def embed_batch_ntv2(
     tokenizer: AutoTokenizer,
     model: AutoModelForMaskedLM,
-    sequence: str,
+    sequences: List[str],
     seq_length: int,
     device: str,
-) -> np.ndarray:
-    """Tokenize a DNA sequence with the NTV2 tokenizer and extract per-token embeddings.
+) -> List[np.ndarray]:
+    """Tokenize a batch of DNA sequences with the NTV2 tokenizer and extract per-token embeddings.
 
     Tokenizes without special tokens so embeddings align 1:1 with sequence tokens.
-    Returns a NumPy array of shape (num_tokens, embedding_dim).
+    Returns a list of NumPy arrays, each of shape (num_tokens_i, embedding_dim).
     """
-    # Tokenize without special tokens for 1:1 alignment
+    assert sequences, "Empty batch"
     enc = tokenizer(
-        sequence,
+        sequences,
         return_tensors="pt",
+        padding=True,
         truncation=True,
         max_length=2048,
         add_special_tokens=False,
@@ -70,59 +96,81 @@ def embed_sequence_ntv2(
         )
 
     # Last hidden state: [batch, seq_len, dim]
-    last = outputs.hidden_states[-1][0]  # take batch=0
+    last = outputs.hidden_states[-1]
 
-    token_embs = last.detach().float().cpu().numpy()  # [num_tokens, embedding_dim]
+    mask_np = attention_mask.bool().cpu().numpy()
+    embs_np = last.detach().float().cpu().numpy()
 
-    return token_embs
+    results = []
+    for i in range(len(sequences)):
+        seq_emb = embs_np[i][mask_np[i]]
+        results.append(seq_emb)
+
+    return results
 
 
-def generate_embeddings_ntv2(
-    sequences: List[str], checkpoint: str, seq_length: int, device: str
-) -> List[np.ndarray]:
-    """Load tokenizer/model from `checkpoint` and compute embeddings for sequences.
+def _make_embed_chunk_ntv2(checkpoint: str, device: str, seq_length: int, batch_size: int):
+    """Load the model and return ``embed_chunk``: sequences -> mean-pooled ``[D]`` arrays.
 
-    Returns a list of NumPy arrays, each of shape (num_tokens, embedding_dim).
+    Sub-batches by ``batch_size`` and reuses ``embed_batch_ntv2``; the model is loaded once.
     """
     logger = logging.getLogger(__name__)
     logger.info(f"Loading NTV2 tokenizer/model from: {checkpoint}")
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
+    model = AutoModelForMaskedLM.from_pretrained(checkpoint, trust_remote_code=True)
+    model_max = tokenizer.model_max_length
+    assert seq_length <= model_max, (
+        f"Requested seq_length={seq_length} > tokenizer.model_max_length={model_max}"
+    )
+    model.to(device)
+    model.eval()
+
+    def embed_chunk(seqs: List[str]) -> List[np.ndarray]:
+        return mean_pool_in_batches(
+            seqs, batch_size, lambda b: embed_batch_ntv2(tokenizer, model, b, seq_length, device)
+        )
+
+    return embed_chunk
+
+
+def generate_embeddings_ntv2(
+    sequences: List[str], checkpoint: str, seq_length: int, device: str, batch_size: int = 32, mean_pool: bool = False
+) -> List[np.ndarray]:
+    """Load tokenizer/model from `checkpoint` and compute embeddings for sequences.
+
+    When ``mean_pool=True``, each per-sequence ``[num_tokens, D]`` embedding is
+    reduced to ``[D]`` before being appended, bounding host RAM at ``N*D`` instead
+    of ``N*num_tokens*D``.
+    """
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading NTV2 tokenizer/model from: {checkpoint}")
+    logger.info(f"Using batch_size={batch_size}, mean_pool={mean_pool}")
 
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, trust_remote_code=True)
-    try:
-        model = AutoModelForMaskedLM.from_pretrained(checkpoint, trust_remote_code=True)
-    except AttributeError:
-        # Stale cached remote code may lack required classes – force re-download
-        logger.warning(
-            "Cached remote code appears stale (missing model class). "
-            "Re-downloading with force_download=True..."
-        )
-        model = AutoModelForMaskedLM.from_pretrained(
-            checkpoint, trust_remote_code=True, force_download=True
-        )
+    model = AutoModelForMaskedLM.from_pretrained(checkpoint, trust_remote_code=True)
 
     # Sanity: ensure seq_length fits tokenizer max length
-    try:
-        model_max = tokenizer.model_max_length
-    except Exception:
-        model_max = None
-
-    if model_max is not None and seq_length > model_max:
-        logger.warning(
-            f"Requested seq_length={seq_length} > tokenizer.model_max_length={model_max}. "
-            f"Sequences might be truncated."
-        )
+    model_max = tokenizer.model_max_length
+    assert seq_length <= model_max, f"Requested seq_length={seq_length} > tokenizer.model_max_length={model_max}"
 
     model.to(device)
     model.eval()
 
     embeddings = []
 
-    for i, seq in enumerate(sequences):
-        emb = embed_sequence_ntv2(tokenizer, model, seq, seq_length, device)
-        embeddings.append(emb)
+    n = len(sequences)
+    log_every_batches = max(1, 100 // batch_size)
 
-        if (i + 1) % 100 == 0:
-            logger.info(f"Generated embeddings for {i + 1}/{len(sequences)} sequences")
+    for batch_idx, start in enumerate(range(0, n, batch_size)):
+        batch = sequences[start : start + batch_size]
+        batch_embs = embed_batch_ntv2(tokenizer, model, batch, seq_length, device)
+        if mean_pool:
+            batch_embs = [emb.mean(axis=0) for emb in batch_embs]
+        embeddings.extend(batch_embs)
+
+        done = min(start + batch_size, n)
+        if (batch_idx + 1) % log_every_batches == 0 or done == n:
+            logger.info(f"Generated embeddings for {done}/{n} sequences")
 
     return embeddings
 
@@ -136,29 +184,46 @@ def main(cfg: DictConfig) -> None:
     set_determinism(int(cfg.seed))
 
     # Load sequences from file or generate random ones
-    input_path = cfg.get("input_path", None)
+    input_path = hy_utils.to_absolute_path(cfg.input_path)
+    identification_mode = cfg.identification_mode
 
-    if input_path is None:
-        raise ValueError("input_path must be provided in the configuration.")
+    if identification_mode:
+        logger.info(f"Loading identification CSV (preserving order, no dedup): {input_path}")
+        id_data = load_identification_csv(input_path)
+        sequences = id_data["sequences"]
+        individual_ids = id_data["individual_ids"]
+        locus_ids = id_data["locus_ids"]
+        haplotypes = id_data["haplotypes"]
+        # Validate sequence length consistency.
+        assert all(len(s) == cfg.seq_length for s in sequences), (
+            "Identification CSV contains sequences not matching cfg.seq_length"
+        )
+        logger.info(
+            f"Loaded {len(sequences)} identification rows "
+            f"({len(set(individual_ids))} individuals, {len(set(locus_ids))} loci)"
+        )
+    else:
+        logger.info(f"Loading sequences from file: {input_path}")
+        logger.info(f"Max sequences (num_sequences): {cfg.num_sequences}")
+        logger.info(f"Max sequence length (seq_length): {cfg.seq_length}")
+        sequences = load_sequences_from_file(
+            input_path, max_length=cfg.seq_length, max_sequences=cfg.num_sequences
+        )
+        individual_ids = None
+        locus_ids = None
+        haplotypes = None
 
-    input_path = hy_utils.to_absolute_path(input_path)
-    logger.info(f"Loading sequences from file: {input_path}")
-    logger.info(f"Max sequences (num_sequences): {cfg.num_sequences}")
-    logger.info(f"Max sequence length (seq_length): {cfg.seq_length}")
-    sequences = load_sequences_from_file(
-        input_path, max_length=cfg.seq_length, max_sequences=cfg.num_sequences
-    )
+        if bool(cfg.get("deduplicate_sequences", True)):
+            original_count = len(sequences)
+            sequences = list(dict.fromkeys(sequences))
+            duplicates_removed = original_count - len(sequences)
+            if duplicates_removed > 0:
+                logger.warning(f"Removed {duplicates_removed} duplicate sequences")
 
-    original_count = len(sequences)
-    sequences = list(dict.fromkeys(sequences))
-    duplicates_removed = original_count - len(sequences)
-
-    if duplicates_removed > 0:
-        logger.warning(f"Removed {duplicates_removed} duplicate sequences")
-
-    logger.info(
-        f"Loaded {len(sequences)} unique sequences from file (limited to {cfg.num_sequences}, truncated to {cfg.seq_length} if needed)"
-    )
+        logger.info(
+            f"Loaded {len(sequences)} sequence windows from file "
+            f"(limited to {cfg.num_sequences}, target length {cfg.seq_length})"
+        )
 
     checkpoint = cfg.checkpoint
     device = cfg.device
@@ -166,29 +231,46 @@ def main(cfg: DictConfig) -> None:
     logger.info(f"Using checkpoint: {checkpoint}")
     logger.info(f"Using device: {device}")
 
-    embeddings = generate_embeddings_ntv2(sequences, checkpoint, int(cfg.seq_length), device)
+    batch_size = cfg.batch_size
 
-    # Split data into train, val, test
-    eval_only = cfg.get("eval_only", False)
-    if eval_only:
-        train_split = 0.0
-        val_split = 0.0
-        test_split = 1.0
-    else:
-        train_split = cfg.train_split
-        val_split = cfg.val_split
-        test_split = 1.0 - train_split - val_split
+    # Resumable, incremental generation for the mean-split and identification
+    # paths (fast-exit on complete, resume on partial). Returns False only for the
+    # legacy all-at-once per-token (mean=false) case.
+    if run_generation(
+        cfg,
+        sequences=sequences,
+        individual_ids=individual_ids,
+        locus_ids=locus_ids,
+        haplotypes=haplotypes,
+        make_embed_chunk=lambda: _make_embed_chunk_ntv2(
+            checkpoint, device, int(cfg.seq_length), int(batch_size)
+        ),
+        logger=logger,
+    ):
+        return
 
-        assert (
-            train_split + val_split + test_split > 0.99
-        ), "Split ratios must sum to approximately 1.0"
+    use_mean = bool(cfg.mean)
+    embeddings = generate_embeddings_ntv2(
+        sequences, checkpoint, int(cfg.seq_length), device, batch_size=batch_size, mean_pool=use_mean
+    )
+
+    # Split data into train, val, test. The mean and identification paths are
+    # handled resumably in run_generation above, so this legacy all-at-once path is
+    # only ever reached for the per-token (mean=false) track -- always a full split.
+    train_split = cfg.train_split
+    val_split = cfg.val_split
+    test_split = 1.0 - train_split - val_split
+    assert (
+        train_split + val_split + test_split > 0.99
+    ), "Split ratios must sum to approximately 1.0"
 
     n = len(sequences)
     train_n = int(n * train_split)
     val_n = int(n * val_split)
 
     indices = np.arange(n)
-    np.random.shuffle(indices)
+    if not identification_mode:
+        np.random.shuffle(indices)
 
     train_idx = indices[:train_n]
     val_idx = indices[train_n : train_n + val_n]
@@ -196,52 +278,41 @@ def main(cfg: DictConfig) -> None:
 
     logger.info(f"Split sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}")
 
-    if eval_only:
-        splits = {"test": test_idx}
+    splits = {
+        "train": train_idx,
+        "val": val_idx,
+        "test": test_idx,
+    }
+
+    # Note: when use_mean=True, each `embeddings[i]` is already shape [D] (pooled
+    # inside the generation loop to bound host RAM); otherwise it is [num_tokens, D].
+
+    # Compute global statistics from TRAINING SET only
+    train_sequences = [sequences[i] for i in splits["train"]]
+    train_embeddings = [embeddings[i] for i in splits["train"]]
+
+    if use_mean:
+        logger.info("Computing global statistics from training set (mean-pooled embeddings)...")
+        all_train_values = np.concatenate([emb.ravel() for emb in train_embeddings])
+        embedding_dim = train_embeddings[0].shape[-1]
     else:
-        splits = {
-            "train": train_idx,
-            "val": val_idx,
-            "test": test_idx,
-        }
+        logger.info(
+            "Computing global statistics from training set (per-nucleotide embeddings)..."
+        )
+        all_train_values = np.concatenate([emb.flatten() for emb in train_embeddings])
+        embedding_dim = train_embeddings[0].shape[1]
 
-    use_mean = cfg.get("mean", False)
+    # Compute global scalar statistics (not per-dimension)
+    global_min = float(np.min(all_train_values))
+    global_max = float(np.max(all_train_values))
+    global_mean = float(np.mean(all_train_values))
+    global_std = float(np.std(all_train_values))
 
-    if eval_only:
-        global_min, global_max, global_mean, global_std = 0.0, 0.0, 0.0, 0.0
-        embedding_dim = embeddings[0].shape[1] if embeddings else 0
-        logger.info("Skipping global statistics computation because eval_only mode is on.")
-    else:
-        # Compute global statistics from TRAINING SET only
-        train_sequences = [sequences[i] for i in splits["train"]]
-        train_embeddings = [embeddings[i] for i in splits["train"]]
-
-        if use_mean:
-            logger.info("Computing global statistics from training set (mean-pooled embeddings)...")
-            # Compute mean pooling for training embeddings
-            train_mean_embeddings = [np.mean(emb, axis=0) for emb in train_embeddings]
-            # Compute global statistics across ALL values in the training set
-            all_train_values = np.concatenate([emb.flatten() for emb in train_mean_embeddings])
-            embedding_dim = train_embeddings[0].shape[1]
-        else:
-            logger.info(
-                "Computing global statistics from training set (per-nucleotide embeddings)..."
-            )
-            # Compute global statistics across ALL values in the training set
-            all_train_values = np.concatenate([emb.flatten() for emb in train_embeddings])
-            embedding_dim = train_embeddings[0].shape[1]
-
-        # Compute global scalar statistics (not per-dimension)
-        global_min = float(np.min(all_train_values))
-        global_max = float(np.max(all_train_values))
-        global_mean = float(np.mean(all_train_values))
-        global_std = float(np.std(all_train_values))
-
-        logger.info("Global statistics from training set:")
-        logger.info(f"  min:  {global_min:.6f}")
-        logger.info(f"  max:  {global_max:.6f}")
-        logger.info(f"  mean: {global_mean:.6f}")
-        logger.info(f"  std:  {global_std:.6f}")
+    logger.info("Global statistics from training set:")
+    logger.info(f"  min:  {global_min:.6f}")
+    logger.info(f"  max:  {global_max:.6f}")
+    logger.info(f"  mean: {global_mean:.6f}")
+    logger.info(f"  std:  {global_std:.6f}")
 
     hashes = {}
 
@@ -253,7 +324,8 @@ def main(cfg: DictConfig) -> None:
 
         if use_mean:
             logger.info(f"Saving mean-pooled embeddings for {split_name} split")
-            mean_embeddings = [np.mean(emb, axis=0) for emb in split_embeddings]
+            # Embeddings were mean-pooled inside the generation loop; each is [D].
+            mean_embeddings = split_embeddings
 
             with h5py.File(output_path, "w") as f:
                 dt_str = h5py.string_dtype(encoding="utf-8")
@@ -266,6 +338,11 @@ def main(cfg: DictConfig) -> None:
                 )
                 for i, emb_mean in enumerate(mean_embeddings):
                     emb_dataset[i] = emb_mean
+
+                if identification_mode:
+                    _write_identification_metadata(
+                        f, split_indices, individual_ids, locus_ids, haplotypes
+                    )
 
                 f.attrs["embedding_dim"] = embedding_dim
                 f.attrs["checkpoint"] = checkpoint
@@ -296,7 +373,12 @@ def main(cfg: DictConfig) -> None:
                 for i, emb in enumerate(split_embeddings):
                     emb_dataset[i] = emb.flatten()
 
-                f.attrs["embedding_dim"] = embeddings[0].shape[1]
+                if identification_mode:
+                    _write_identification_metadata(
+                        f, split_indices, individual_ids, locus_ids, haplotypes
+                    )
+
+                f.attrs["embedding_dim"] = embedding_dim
                 f.attrs["checkpoint"] = checkpoint
 
                 # STORE GLOBAL STATS
@@ -312,32 +394,28 @@ def main(cfg: DictConfig) -> None:
         hashes[split_name] = sha256_hash
         logger.info(f"SHA256 hash of {output_path}: {sha256_hash}")
 
-    if cfg.get("update_config", False):
+    if "update_config" in cfg and cfg.update_config:
         config_path = hy_utils.to_absolute_path(cfg.update_config)
         logger.info(f"Updating config file {config_path}...")
         updates = {
             "test_sha256": hashes["test"],
             "skip_sha256_check": False,
             "test_csv": cfg.test_output_path,
-            "embedding_dim": (
-                embeddings[0].shape[1] if embeddings else 0
-            ),  # Should be safe as processed
+            "embedding_dim": embedding_dim,
             "seq_length": cfg.seq_length,
         }
-        if not eval_only:
-            updates["train_sha256"] = hashes["train"]
-            updates["val_sha256"] = hashes["val"]
-            updates["train_csv"] = cfg.train_output_path
-            updates["val_csv"] = cfg.val_output_path
+        updates["train_sha256"] = hashes["train"]
+        updates["val_sha256"] = hashes["val"]
+        updates["train_csv"] = cfg.train_output_path
+        updates["val_csv"] = cfg.val_output_path
 
         update_yaml_keys(str(config_path), updates)
         logger.info("Config file updated.")
     else:
         print(f"Update conf/config.yaml data section:")
-        if not eval_only:
-            print(f"train_sha256: {hashes.get('train', 'None')}")
-            print(f"val_sha256: {hashes.get('val', 'None')}")
-        print(f"test_sha256: {hashes.get('test', 'None')}")
+        print(f"train_sha256: {hashes['train']}")
+        print(f"val_sha256: {hashes['val']}")
+        print(f"test_sha256: {hashes['test']}")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,0 +1,25 @@
+model_file_name: model/query_decoder.py
+model_name: query_decoder
+model_type: query_decoder
+mode: mean
+
+# Query-decoder architecture.
+# Capacity raised (d_model 256->384, layers 4->6, ff 1024->1536, context
+# tokens 8->16) because mean-mode runs underfit (train~=val). The context-token
+# bottleneck also scales better than the encoder/decoder mean-expansion for
+# high-dim inputs (e.g. Evo2 4096), so prefer this model when memory is tight.
+d_model: 384
+nhead: 8
+num_layers: 6
+dim_feedforward: 1536
+dropout: 0.1
+
+# Context / length-conditioning specifics
+n_context_tokens: 16
+aux_length_loss_weight: 0.5
+
+# Filled at runtime from tokenizer.vocab_size
+output_dim: 4
+
+# For config compatibility (not used by this model)
+hidden_dims: []

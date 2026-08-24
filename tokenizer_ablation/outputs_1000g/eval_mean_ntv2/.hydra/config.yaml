@@ -1,7 +1,0 @@
-run_dir: outputs/train_mean_ntv2
-runs_base_dir: outputs
-device: cuda:0
-max_samples: null
-corrector_iterations: 1
-only_plots: false
-aggregate_only: false

@@ -1,11 +1,44 @@
-data/*.h5
-data/*.csv
+# Generated data and model artifacts
+data/**/*.h5
+data/**/*.csv
+data/**/*.manifest.json
+data/**/*.vcf
+data/**/*.vcf.gz
+data/**/*.tbi
+data/1000g_vcfs/
 data/*.fa
-data/*.fa.fai
+data/*.fa.*
+data/*.bed
+data/*.bed.gz
+data/*.bb
+outputs*/
+tokenizer_ablation/outputs/
 model.pt
-tex/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.pdf
+*.png
+*_results.json
+evaluation_results.json
+comparison_metrics.json
+.hydra/
+wandb/
+mlruns/
 
-# Generated .gitignore patterns
+# Manuscript and generated figures
+tex/
+*.tex
+*.bib
+
+# Scheduler and runtime logs
+*.out
+*.err
+*.log
+prepare.log
+backups/
 
 # Python
 __pycache__/
@@ -24,42 +57,30 @@ var/
 wheels/
 *.egg-info/
 .installed.cfg
-*.egg
 htmlcov/
 .tox/
 .coverage
-.cache
+.cache/
 .pytest_cache/
-.env
-.venv
-env/
-venv/
-.ipynb_checkpoints
 .mypy_cache/
 .ruff_cache/
+.env
+.venv/
+env/
+venv/
+.ipynb_checkpoints/
 
-# Cache Files
-*.cache
-.cache/
-cache/
-**/cache/
-.npm/
-.yarn/
-
-# Dependencies
+# Editor and dependency caches
+.vscode/
+.history/
 node_modules/
 vendor/
 packages/
+.npm/
+.yarn/
 
-# Build Output
-build/
-dist/
-out/
-*.min.*
-*.map
-
-# VS Code
-.vscode/
-.history/
-.github/copilot-instructions.md
+# Generated archives and large BWA index files
 outputs.tar
+data/hg38.fa.sa
+data/hg38.fa.bwt
+data/hg38.fa.pac

@@ -1,0 +1,9 @@
+defaults:
+  - hg38_multilen_seqdisjoint/_base@_here_
+  - _self_
+
+fm_slug: evo2
+embedding_dim: 4096
+tokenizer:
+  type: char
+checkpoint: evo2_7b

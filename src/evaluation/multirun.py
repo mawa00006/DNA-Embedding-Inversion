@@ -22,11 +22,36 @@ from src.plotting_utils import (
 )
 
 
+def _walk_run_subdirs(root: str, require_model: bool) -> List[str]:
+    """Recursively find descendants of `root` containing .hydra/config.yaml.
+
+    Stops descending once a run directory is found so we don't recurse into
+    a run's own internal subdirectories. Supports sweep layouts where
+    ``hydra.job.override_dirname`` contains a ``/`` (e.g. ``data=hg38/...``),
+    which Hydra renders as an intermediate directory level.
+    """
+    if not os.path.isdir(root):
+        return []
+
+    found: List[str] = []
+    for dirpath, dirnames, _ in os.walk(root):
+        if dirpath == root:
+            continue
+        config_path = os.path.join(dirpath, ".hydra", "config.yaml")
+        if not os.path.exists(config_path):
+            continue
+        if require_model and not os.path.exists(os.path.join(dirpath, "model.pt")):
+            continue
+        found.append(dirpath)
+        dirnames.clear()  # don't descend into a run's own subdirs
+    return found
+
+
 def is_multirun_directory(run_dir: str) -> bool:
     """Check if a directory is a Hydra multirun directory.
 
-    A multirun directory contains subdirectories
-    each with their own .hydra/config.yaml.
+    A multirun directory contains (possibly nested) subdirectories
+    each with their own .hydra/config.yaml and model.pt.
 
     Parameters
     ----------
@@ -38,19 +63,7 @@ def is_multirun_directory(run_dir: str) -> bool:
     bool
         True if multirun directory, False otherwise.
     """
-    if not os.path.isdir(run_dir):
-        return False
-
-    # Check for subdirectories containing .hydra/config.yaml
-    for d in os.listdir(run_dir):
-        subdir_path = os.path.join(run_dir, d)
-        if os.path.isdir(subdir_path):
-            config_path = os.path.join(subdir_path, ".hydra", "config.yaml")
-            model_path = os.path.join(subdir_path, "model.pt")
-            if os.path.exists(config_path) and os.path.exists(model_path):
-                return True
-
-    return False
+    return len(_walk_run_subdirs(run_dir, require_model=True)) > 0
 
 
 def get_multirun_subdirs(multirun_dir: str) -> List[str]:
@@ -66,13 +79,7 @@ def get_multirun_subdirs(multirun_dir: str) -> List[str]:
     List[str]
         Sorted list of full paths to subdirectories.
     """
-    subdirs = []
-    for d in os.listdir(multirun_dir):
-        subdir_path = os.path.join(multirun_dir, d)
-        if os.path.isdir(subdir_path):
-            config_path = os.path.join(subdir_path, ".hydra", "config.yaml")
-            if os.path.exists(config_path):
-                subdirs.append(subdir_path)
+    subdirs = _walk_run_subdirs(multirun_dir, require_model=False)
 
     # Sort logic: try to extract the trailing job number (e.g. ..._0, ..._1)
     # If not found, fall back to alphabetical
@@ -101,7 +108,7 @@ def aggregate_and_plot_multirun(
     Parameters
     ----------
     results_list : List[Dict[str, Any]]
-        List of results from evaluate_single_run or evaluate_corrector_run.
+        List of results from evaluate_single_run.
     output_dir : str
         Directory to save aggregate plots.
     logger : logging.Logger

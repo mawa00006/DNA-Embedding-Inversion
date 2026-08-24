@@ -49,8 +49,10 @@ _INVERSION_MODEL_INDEX = {
     "resnet": 1,
     "mlp": 2,
     "decoder": 3,
+    "query_decoder": 4,
     "knn": 5,
     "linear": 6,
+    "mask_predict": 7,
 }
 
 INVERSION_MODEL_DISPLAY_NAMES = {
@@ -58,8 +60,10 @@ INVERSION_MODEL_DISPLAY_NAMES = {
     "resnet": "ResNet",
     "mlp": "MLP",
     "decoder": "Decoder",
+    "query_decoder": "Query Decoder",
     "knn": "Nearest Neighbor",
     "linear": "Linear",
+    "mask_predict": "Mask-Predict",
 }
 
 # Keyword --> special color (checked before FM/IM parsing)
@@ -69,7 +73,6 @@ _SPECIAL_COLORS = {
     "true": "#2ca02c",
     "predicted": "#ff7f0e",
     "expected": "#000000",
-    "corrector": "#8B4513",
     "median": "#9467bd",
 }
 
@@ -119,9 +122,11 @@ def _get_model_properties_from_name(name: str) -> Dict[str, str]:
     else:
         fm = "other"
 
-    # Inversion model
+    # Inversion model. ``query_decoder`` must be checked before ``decoder``
+    # because "decoder" is a substring of "query_decoder" -- otherwise both
+    # collapse to the same label/colour in multi-model plots.
     im = "other"
-    for key in ("encoder", "resnet", "mlp", "knn", "decoder", "linear"):
+    for key in ("encoder", "resnet", "mlp", "knn", "mask_predict", "query_decoder", "decoder", "linear"):
         if key in inversion_part:
             im = key
             break

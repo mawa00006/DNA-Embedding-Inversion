@@ -27,7 +27,10 @@ from src.utils import (
 )
 from src.data import (
     load_split_embeddings,
+    load_multi_split_embeddings,
     create_dataset,
+    create_multi_dataset,
+    max_target_length,
 )
 from src.train import fit, evaluate
 from src.tokenizers import CharacterTokenizer, HuggingFaceTokenizer
@@ -98,6 +101,10 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
         model_class_name = "KNNReconstructor"
     elif model_type == "resnet":
         model_class_name = "ResNetReconstructor"
+    elif model_type == "query_decoder":
+        model_class_name = "QueryDecoderReconstructor"
+    elif model_type == "mask_predict":
+        model_class_name = "MaskPredictReconstructor"
 
     elif mode == "mean":
         model_class_name = "SequenceMeanReconstructor"
@@ -107,7 +114,19 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
     ModelClass = dynamic_import_class(model_file_path, model_class_name)
 
     # 5. Load data with HDF5 for true lazy loading
-    data_dict, counts_dict, train_stats = load_split_embeddings(cfg.data)
+    is_multi = cfg.data.get("multi", False)
+    if is_multi:
+        assert mode == "mean", (
+            "Multi-length training is currently only supported in 'mean' mode "
+            "(model input is a fixed-size mean embedding regardless of sequence length)."
+        )
+        data_dict, counts_dict, train_stats = load_multi_split_embeddings(cfg.data)
+        logger.info(
+            f"Multi-length mode: {len(cfg.data.seq_lengths)} sequence lengths "
+            f"({list(cfg.data.seq_lengths)})"
+        )
+    else:
+        data_dict, counts_dict, train_stats = load_split_embeddings(cfg.data)
     logger.info(f"Loaded - train: {counts_dict['train']}, val: {counts_dict['val']}")
 
     data_is_mean = cfg.data.get("mean", False)
@@ -128,18 +147,39 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
         if split == "val":
             max_samples = cfg.train.max_val_samples
 
-        dataset = create_dataset(
-            data_dict[split],
-            mode,
-            tokenizer,
-            cfg.data.embedding_dim,
-            cfg.data.seq_length,
-            normalization_stats=train_stats if train_stats else None,
-            normalization_method=cfg.data.normalization_method,
-            data_is_mean=data_is_mean,
-            subset_fraction=cfg.data.subset_fraction,
-            max_samples=max_samples,
-        )
+        if is_multi:
+            # Train shards may add extra per-length data (train_seq_lengths);
+            # val keeps one file per canonical length (seq_lengths).
+            split_seq_lengths = (
+                list(cfg.data.train_seq_lengths)
+                if split == "train"
+                else list(cfg.data.seq_lengths)
+            )
+            dataset = create_multi_dataset(
+                data_files=data_dict[split],
+                seq_lengths=split_seq_lengths,
+                mode=mode,
+                tokenizer=tokenizer,
+                embedding_dim=cfg.data.embedding_dim,
+                normalization_stats=train_stats if train_stats else None,
+                normalization_method=cfg.data.normalization_method,
+                data_is_mean=data_is_mean,
+                subset_fraction=cfg.data.subset_fraction,
+                max_samples=max_samples,
+            )
+        else:
+            dataset = create_dataset(
+                data_dict[split],
+                mode,
+                tokenizer,
+                cfg.data.embedding_dim,
+                cfg.data.seq_length,
+                normalization_stats=train_stats if train_stats else None,
+                normalization_method=cfg.data.normalization_method,
+                data_is_mean=data_is_mean,
+                subset_fraction=cfg.data.subset_fraction,
+                max_samples=max_samples,
+            )
 
         use_workers = cfg.optim.num_workers > 0
         loaders[split] = DataLoader(
@@ -157,21 +197,37 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
     logger.info(f"DataLoaders created - train: {len(train_loader)}, val: {len(val_loader)} batches")
 
     # 7. Instantiate model, optimizer, and loss function
-    # Calculate effective sequence length (number of tokens)
-    # We use .get("type") for robust access to Hydra DictConfig
-    if str(tokenizer_cfg.get("type", "")) == "huggingface":
-        # For subword tokenizers, the number of tokens is much less than nucleotides
-        # We use a dummy sequence to find the baseline token length and add headroom
-        dummy_seq = "N" * cfg.data.seq_length
-        encoded_dummy = tokenizer.encode(dummy_seq)
-        # Use a safe upper bound: baseline token length + 20% headroom
-        effective_seq_length = int(len(encoded_dummy) * 1.2) + 2
+    # Calculate effective sequence length (number of tokens). One extra slot is
+    # reserved for the EOS token that the dataset appends to every target.
+    if tokenizer_cfg.type == "huggingface":
+        # Size the decoder from the data it is actually trained and validated on.
+        # A probe sequence cannot do this job: the previous "N" * seq_length probe
+        # was the one string the pipeline never contains (prepare_hg38.py drops
+        # every N-containing chunk), and since neither DNA tokenizer has merges
+        # for 'N' it shattered into one token per nucleotide and over-sized the
+        # decoder ~5x -- 123 slots where 30 (DNABERT-2) and 21 (NTv2) suffice.
+        # val is scanned alongside train because fit() computes the same loss on it.
+        if is_multi:
+            scan_splits = [
+                (data_dict["train"], list(cfg.data.train_seq_lengths)),
+                (data_dict["val"], list(cfg.data.seq_lengths)),
+            ]
+        else:
+            scan_splits = [
+                ([data_dict[split]], [cfg.data.seq_length]) for split in ["train", "val"]
+            ]
+        effective_seq_length = max(
+            max_target_length(files, seq_lengths, tokenizer)
+            for files, seq_lengths in scan_splits
+        )
         logger.info(
-            f"Adjusted effective_seq_length for subword tokenizer: "
-            f"{cfg.data.seq_length} nt -> {effective_seq_length} tokens (max)"
+            f"Sized effective_seq_length from the data: {cfg.data.seq_length} nt -> "
+            f"{effective_seq_length} tokens (longest observed target, includes EOS)"
         )
     else:
-        effective_seq_length = cfg.data.seq_length
+        # The character tokenizer emits exactly one token per nucleotide, so the
+        # longest target is known without scanning: seq_length tokens + EOS.
+        effective_seq_length = cfg.data.seq_length + 1
 
     # Build model kwargs based on model type and mode
     if model_type == "encoder" or model_type == "decoder":
@@ -205,6 +261,37 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
             "n_blocks": cfg.model.n_blocks,
             "kernel_size": cfg.model.kernel_size,
             "dropout": cfg.model.dropout,
+        }
+
+    elif model_type == "query_decoder":
+        model_kwargs = {
+            "input_dim": cfg.data.embedding_dim,
+            "mode": mode,
+            "seq_length": effective_seq_length,
+            "output_dim": tokenizer.vocab_size,
+            "d_model": cfg.model.d_model,
+            "nhead": cfg.model.nhead,
+            "num_layers": cfg.model.num_layers,
+            "dim_feedforward": cfg.model.dim_feedforward,
+            "dropout": cfg.model.dropout,
+            "n_context_tokens": cfg.model.n_context_tokens,
+            "aux_length_loss_weight": cfg.model.aux_length_loss_weight,
+        }
+
+    elif model_type == "mask_predict":
+        model_kwargs = {
+            "input_dim": cfg.data.embedding_dim,
+            "mode": mode,
+            "seq_length": effective_seq_length,
+            "output_dim": tokenizer.vocab_size,
+            "d_model": cfg.model.d_model,
+            "nhead": cfg.model.nhead,
+            "num_layers": cfg.model.num_layers,
+            "dim_feedforward": cfg.model.dim_feedforward,
+            "dropout": cfg.model.dropout,
+            "n_context_tokens": cfg.model.n_context_tokens,
+            "aux_length_loss_weight": cfg.model.aux_length_loss_weight,
+            "num_iterations": cfg.model.num_iterations,
         }
 
     elif mode == "mean":
@@ -251,6 +338,17 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
             model.parameters(),
             lr=cfg.optim.lr,
             weight_decay=cfg.optim.weight_decay,
+            eps=cfg.optim.eps,
+        )
+
+        # OneCycleLR is a fixed-horizon schedule: total_steps is sized to the
+        # full epoch budget and the LR only reaches its convergence-friendly
+        # minimum at the final step. Early stopping would cut it off mid-anneal
+        # (near peak LR), so the two are mutually exclusive. Fail fast on the
+        # contradiction rather than silently training an un-annealed model.
+        assert not (cfg.optim.use_scheduler and cfg.train.early_stopping.enabled), (
+            "optim.use_scheduler=true (OneCycleLR) requires train.early_stopping.enabled=false; "
+            "early stopping interrupts the LR anneal. Disable one of them."
         )
 
         # Create learning rate scheduler if enabled
@@ -290,6 +388,10 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
             early_stopping_enabled=cfg.train.early_stopping.enabled,
             early_stopping_patience=cfg.train.early_stopping.patience,
             early_stopping_min_delta=cfg.train.early_stopping.min_delta,
+            checkpoint_path=os.path.join(output_dir, "checkpoint.pt"),
+            grad_clip_norm=cfg.optim.grad_clip_norm,
+            skip_frac_threshold=cfg.train.nan_backoff.skip_frac_threshold,
+            lr_backoff=cfg.train.nan_backoff.lr_backoff,
         )
 
     logger.info(
@@ -318,6 +420,13 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
         model_path,
     )
     logger.info(f"Saved model checkpoint to {model_path}")
+
+    # Training finished and the final model is persisted; the resumable per-epoch
+    # checkpoint is now redundant, so drop it to reclaim disk.
+    resume_ckpt_path = os.path.join(output_dir, "checkpoint.pt")
+    if os.path.exists(resume_ckpt_path):
+        os.remove(resume_ckpt_path)
+        logger.info(f"Removed resume checkpoint {resume_ckpt_path}")
 
     # Also store results separately for easy inspection
     save_json(results, os.path.join(output_dir, "results.json"))

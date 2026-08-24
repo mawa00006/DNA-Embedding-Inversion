@@ -1,0 +1,10 @@
+defaults:
+  - hg38_multilen_seqdisjoint/_base@_here_
+  - _self_
+
+fm_slug: dnabert2
+embedding_dim: 768
+tokenizer:
+  type: huggingface
+  model_name: zhihan1996/DNABERT-2-117M
+checkpoint: zhihan1996/DNABERT-2-117M

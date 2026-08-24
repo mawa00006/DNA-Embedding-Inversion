@@ -1,0 +1,30 @@
+model_file_name: model/mask_predict_decoder.py
+model_name: mask_predict
+model_type: mask_predict
+mode: mean
+
+# Mask-Predict (CMLM) refiner. Shares the query-decoder backbone (context-token
+# bottleneck + length head), adding a per-position token embedding so the model
+# can condition on its own partial reconstruction and refine it iteratively.
+# Capacity mirrors query_decoder (d_model 384, layers 6, ff 1536, 16 context
+# tokens) since the two share the underlying decoder.
+d_model: 384
+nhead: 8
+num_layers: 6
+dim_feedforward: 1536
+dropout: 0.1
+
+# Context / length-conditioning specifics
+n_context_tokens: 16
+aux_length_loss_weight: 0.5
+
+# Iterative-refinement passes at inference. 1 reproduces the single-shot
+# decoder; higher values trade compute for coherence. Training is unaffected
+# (the random-mask CMLM objective covers every partial-observation state).
+num_iterations: 10
+
+# Filled at runtime from tokenizer.vocab_size
+output_dim: 4
+
+# For config compatibility (not used by this model)
+hidden_dims: []

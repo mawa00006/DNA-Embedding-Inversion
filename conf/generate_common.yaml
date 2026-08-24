@@ -2,12 +2,27 @@ device: cuda:0
 input_path: null
 update_config: null
 
-num_sequences: 100000
-seq_length: 50
+num_sequences: 1000000
+seq_length: 0
 seed: 42
 mean: false
-train_split: 0.7
-val_split: 0.15
+train_split: 0.9
+val_split: 0.05
+# Fixed-count split override for the mean path: when both are set (e.g. 50000),
+# exactly this many rows go to val/test and ALL the rest to train, so val/test
+# stay constant across lengths while only the train size grows. null -> use the
+# train_split/val_split fractions above.
+val_size: null
+test_size: null
+# Samples embedded between incremental HDF5 flushes during resumable mean /
+# identification generation. A crash loses at most this many in-flight samples.
+gen_chunk_size: 2000
+identification_mode: false
+# Legacy sequence CSVs were content-deduplicated after loading. Coordinate-aware
+# multi-length corpora deliberately keep distinct genomic windows even when a
+# repeat gives two windows the same string; set this false in the multilen jobs.
+deduplicate_sequences: true
+batch_size: 32
 
 hydra:
   run:

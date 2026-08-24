@@ -1,8 +1,10 @@
-"""Cross-dataset comparison: Encoder model across Foundation Models.
+"""Cross-dataset comparison: one inversion model across Foundation Models.
 
-Reads evaluation_results.json files from each FM's eval directory
-and produces publication-ready Levenshtein Similarity and Accuracy
-vs Sequence Length plots comparing DNABERT-2, Evo 2, NTv2 + Random Baseline.
+Reads evaluation_results.json files from each FM's eval directory, filters to a
+single inversion architecture (``--inversion-model``, e.g. ``encoder`` or
+``query_decoder``), and produces publication-ready Levenshtein Similarity and
+Accuracy vs Sequence Length plots comparing DNABERT-2, Evo 2, NTv2 + Random
+Baseline.
 """
 
 import argparse
@@ -39,9 +41,10 @@ FM_CONFIG = {
 }
 
 
-def _load_encoder_results(eval_dir: str):
+def _load_architecture_results(eval_dir: str, inversion_model: str):
     """Load all evaluation_results.json files from eval_dir/run_*/,
-    filter to encoder runs, and return sorted (seq_length, mean, std, baseline_mean) tuples."""
+    filter to runs of ``inversion_model`` (e.g. "encoder", "query_decoder"),
+    and return sorted (seq_length, mean, std, baseline_mean) tuples."""
     seq_lengths = []
     lev_means = []
     lev_stds = []
@@ -67,11 +70,11 @@ def _load_encoder_results(eval_dir: str):
         with open(results_path, "r") as f:
             res = json.load(f)
 
-        # Check if this is an encoder model
-        # Use the same parsing as plotting_utils
+        # Keep only runs of the requested inversion model.
+        # Use the same parsing as plotting_utils.
         model_name = res.get("inversion_model", "")
         props = _get_model_properties_from_name(model_name)
-        if props["im"] != "encoder":
+        if props["im"] != inversion_model:
             continue
 
         seq_lengths.append(res["seq_length"])
@@ -83,7 +86,7 @@ def _load_encoder_results(eval_dir: str):
         baseline_lev_stds.append(res["baseline_levenshtein_std"])
         baseline_acc_means.append(res["baseline_accuracy_metrics"]["nucleotide_accuracy"])
 
-    assert len(seq_lengths) > 0, f"No encoder results found in {eval_dir}"
+    assert len(seq_lengths) > 0, f"No {inversion_model} results found in {eval_dir}"
 
     # Sort by sequence length
     sort_idx = np.argsort(seq_lengths)
@@ -269,25 +272,22 @@ def _plot_cross_dataset_per_position_accuracy(
 def _load_ned_data(analysis_dir: str):
     """Load NED distributions from an analysis sweep directory.
 
-    Scans numbered subdirectories (Hydra multirun), reads ``stats.json``
-    for the sequence length and ``norm_euclidean_dists.npy`` for the raw
-    distance vector.
+    Walks the sweep recursively (Hydra sweep subdirs may be nested one level
+    deeper when ``hydra.job.override_dirname`` contains a ``/``, e.g.
+    ``data=hg38/...``), reading ``stats.json`` for the sequence length and
+    ``norm_euclidean_dists.npy`` for the raw distance vector from every run
+    directory that has both.
 
     Returns a dict mapping ``seq_length -> np.ndarray``.
     """
     ned_by_seqlen = {}
-    for subdir in os.listdir(analysis_dir):
-        subdir_path = os.path.join(analysis_dir, subdir)
-        if not os.path.isdir(subdir_path):
+    for dirpath, _dirnames, filenames in os.walk(analysis_dir):
+        if "stats.json" not in filenames or "norm_euclidean_dists.npy" not in filenames:
             continue
-        stats_path = os.path.join(subdir_path, "stats.json")
-        npy_path = os.path.join(subdir_path, "norm_euclidean_dists.npy")
-        if not os.path.isfile(stats_path) or not os.path.isfile(npy_path):
-            continue
-        with open(stats_path, "r") as f:
+        with open(os.path.join(dirpath, "stats.json"), "r") as f:
             st = json.load(f)
         seq_length = int(st["avg_seq_len"])
-        ned_by_seqlen[seq_length] = np.load(npy_path)
+        ned_by_seqlen[seq_length] = np.load(os.path.join(dirpath, "norm_euclidean_dists.npy"))
     assert len(ned_by_seqlen) > 0, f"No NED .npy files found in {analysis_dir}"
     return ned_by_seqlen
 
@@ -331,12 +331,19 @@ def _plot_merged_ned(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cross-dataset Encoder comparison plots.")
+    parser = argparse.ArgumentParser(description="Cross-dataset inversion-model comparison plots.")
     parser.add_argument(
         "--eval-dirs",
         nargs="+",
         required=True,
         help="Eval output directories, one per FM (e.g. outputs/eval_mean_dnabert2 ...)",
+    )
+    parser.add_argument(
+        "--inversion-model",
+        default="encoder",
+        help="Inversion architecture to compare across FMs (e.g. encoder, "
+        "query_decoder, decoder). Used to filter run_*/ subdirs and to prefix "
+        "the output plot filenames.",
     )
     parser.add_argument(
         "--analysis-dirs",
@@ -402,8 +409,10 @@ def main():
             f"Expected one of: {list(FM_CONFIG.keys())}"
         )
 
-        logger.info(f"Loading encoder results for {FM_CONFIG[fm_key]} from {eval_dir}")
-        fm_data[fm_key] = _load_encoder_results(eval_dir)
+        logger.info(
+            f"Loading {args.inversion_model} results for {FM_CONFIG[fm_key]} from {eval_dir}"
+        )
+        fm_data[fm_key] = _load_architecture_results(eval_dir, args.inversion_model)
         logger.info(
             f"  Found {len(fm_data[fm_key]['seq_lengths'])} sequence lengths: "
             f"{fm_data[fm_key]['seq_lengths'].tolist()}"
@@ -417,7 +426,9 @@ def main():
         metric_key="lev_means",
         std_key="lev_stds",
         ylabel="Levenshtein Similarity",
-        output_path=os.path.join(args.output_dir, "encoder_levenshtein_vs_seqlen"),
+        output_path=os.path.join(
+            args.output_dir, f"{args.inversion_model}_levenshtein_vs_seqlen"
+        ),
         baseline_key="baseline_lev_means",
         baseline_std_key="baseline_lev_stds",
     )
@@ -428,7 +439,9 @@ def main():
         metric_key="acc_means",
         std_key="acc_stds",
         ylabel="Nucleotide Accuracy",
-        output_path=os.path.join(args.output_dir, "encoder_accuracy_vs_seqlen"),
+        output_path=os.path.join(
+            args.output_dir, f"{args.inversion_model}_accuracy_vs_seqlen"
+        ),
         baseline_key="baseline_acc_means",
     )
 

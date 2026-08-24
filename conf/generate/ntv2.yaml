@@ -5,7 +5,7 @@ defaults:
 
 checkpoint: InstaDeepAI/nucleotide-transformer-v2-500m-multi-species
 
-update_config: conf/data/ntv2_${seq_length}_hg38.yaml
-train_output_path: data/train_ntv2_${seq_length}_hg38_per_token.h5
-val_output_path: data/val_ntv2_${seq_length}_hg38_per_token.h5
-test_output_path: data/test_ntv2_${seq_length}_hg38_per_token.h5
+update_config: conf/data/hg38/ntv2_${seq_length}_hg38.yaml
+train_output_path: data/hg38/train_ntv2_${seq_length}_hg38_per_token.h5
+val_output_path: data/hg38/val_ntv2_${seq_length}_hg38_per_token.h5
+test_output_path: data/hg38/test_ntv2_${seq_length}_hg38_per_token.h5

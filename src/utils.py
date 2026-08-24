@@ -99,7 +99,14 @@ def file_sha256(path: str) -> str:
 def load_sequences_from_file(
     file_path: str, max_length: int | None = None, max_sequences: int | None = None
 ) -> List[str]:
-    """Load DNA sequences from a text file (one sequence per line).
+    """Load DNA sequences from a text file or grouped multi-length HDF5.
+
+    Text files retain the legacy one-sequence-per-line behaviour, including the
+    optional truncation to ``max_length``.  A multi-length source HDF5 produced
+    by ``scripts/prepare_hg38_multilen.py`` is selected by exact length instead:
+    ``max_length=L`` reads ``/lengths/L/sequences`` without truncation.  This
+    lets all three foundation-model embedding generators consume the same
+    coordinate-aware source corpus while preserving their old text inputs.
 
     Parameters
     ----------
@@ -115,6 +122,53 @@ def load_sequences_from_file(
     List[str]
         List of DNA sequences.
     """
+    import h5py
+
+    if h5py.is_hdf5(file_path):
+        assert max_length is not None, (
+            "Selecting a multi-length HDF5 source requires max_length/seq_length"
+        )
+        with h5py.File(file_path, "r", swmr=True) as handle:
+            schema = str(handle.attrs.get("schema", ""))
+            supported_schemas = {
+                "dna_inversion_hg38_multilen_v1",
+                "dna_inversion_hg38_multilen_v2",
+                "dna_inversion_1000g_multilen_v1",
+                "dna_inversion_1000g_multilen_v2",
+            }
+            assert schema in supported_schemas, (
+                f"Unsupported sequence-source HDF5 schema {schema!r}: {file_path}"
+            )
+            group_path = f"lengths/{int(max_length)}"
+            assert group_path in handle, (
+                f"Sequence length {max_length} missing from {file_path}; "
+                f"available={sorted(map(int, handle['lengths'].keys()))}"
+            )
+            dataset = handle[f"{group_path}/sequences"]
+            n = len(dataset) if max_sequences is None else min(len(dataset), max_sequences)
+            raw = dataset[:n]
+            sequences = [
+                value.decode("utf-8") if isinstance(value, bytes) else str(value)
+                for value in raw
+            ]
+            if max_sequences is None and "ordered_sequence_sha256" in handle[
+                group_path
+            ].attrs:
+                digest = hashlib.sha256()
+                for sequence in sequences:
+                    digest.update(sequence.encode("ascii"))
+                    digest.update(b"\n")
+                expected = str(
+                    handle[group_path].attrs["ordered_sequence_sha256"]
+                )
+                assert digest.hexdigest() == expected, (
+                    f"Sequence-source content hash mismatch in {file_path}:{group_path}"
+                )
+        assert all(len(sequence) == max_length for sequence in sequences), (
+            f"Multi-length source group {group_path} contains a malformed sequence"
+        )
+        return sequences
+
     with open(file_path, "r") as f:
         sequences = [line.strip() for line in f if line.strip()]
 
@@ -125,6 +179,57 @@ def load_sequences_from_file(
         sequences = [seq[:max_length] for seq in sequences]
 
     return sequences
+
+
+def load_identification_csv(
+    file_path: str,
+) -> Dict[str, List]:
+    """Load a per-individual identification CSV produced by ``scripts/prepare_identification.py``.
+
+    Expected header: ``individual_id,locus_id,haplotype,sequence``.
+
+    Order is preserved (no dedup, no shuffle) so downstream code can keep
+    parallel arrays of metadata aligned with embeddings.
+
+    Parameters
+    ----------
+    file_path : str
+        Path to the CSV file.
+
+    Returns
+    -------
+    dict
+        Keys ``individual_ids`` (list[str]), ``locus_ids`` (list[int]),
+        ``haplotypes`` (list[int]), ``sequences`` (list[str]).
+    """
+    individual_ids: List[str] = []
+    locus_ids: List[int] = []
+    haplotypes: List[int] = []
+    sequences: List[str] = []
+
+    with open(file_path, "r") as f:
+        header = f.readline().strip()
+        assert header == "individual_id,locus_id,haplotype,sequence", (
+            f"Unexpected identification CSV header: {header!r}"
+        )
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            assert len(parts) == 4, f"Malformed identification CSV row: {line!r}"
+            individual_ids.append(parts[0])
+            locus_ids.append(int(parts[1]))
+            haplotypes.append(int(parts[2]))
+            sequences.append(parts[3])
+
+    assert len(sequences) > 0, f"Identification CSV is empty: {file_path}"
+    return {
+        "individual_ids": individual_ids,
+        "locus_ids": locus_ids,
+        "haplotypes": haplotypes,
+        "sequences": sequences,
+    }
 
 
 class NpEncoder(json.JSONEncoder):
@@ -152,6 +257,37 @@ def save_json(data: Dict[str, Any], path: str) -> None:
     """
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, cls=NpEncoder)
+
+
+def is_topk_hit(
+    scores: np.ndarray,
+    target_idx: int,
+    k: int,
+    rng: np.random.Generator,
+    descending: bool,
+) -> bool:
+    """Whether ``target_idx`` ranks within the top ``k`` entries of ``scores``.
+
+    Ties at the cut-off are broken uniformly at random via ``rng``, so that
+    equal-scoring candidates - including a fully uninformative all-equal vector -
+    do not systematically favour any index. ``descending=True`` ranks larger
+    scores first (e.g. similarities); ``descending=False`` ranks smaller first
+    (e.g. distances).
+    """
+    assert scores.ndim == 1, f"scores must be 1D, got shape {scores.shape}"
+    assert k >= 1, f"k must be >= 1, got {k}"
+    target = scores[target_idx]
+    if descending:
+        n_better = int((scores > target).sum())
+    else:
+        n_better = int((scores < target).sum())
+    if n_better >= k:
+        return False
+    n_tied = int((scores == target).sum())  # includes target itself
+    slots = k - n_better
+    if slots >= n_tied:
+        return True
+    return bool(rng.random() < slots / n_tied)
 
 
 def maybe_init_wandb(cfg: DictConfig):  # noqa: D401
