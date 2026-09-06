@@ -1,0 +1,9 @@
+defaults:
+  - hg38_multilen_seqdisjoint/_base@_here_
+  - _self_
+
+fm_slug: hyenadna_large
+embedding_dim: 256
+tokenizer:
+  type: char
+checkpoint: LongSafari/hyenadna-large-1m-seqlen-hf
