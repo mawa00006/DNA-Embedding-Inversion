@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - /generate_common
+  - _self_
+
+checkpoint: RaphaelMourad/Mistral-DNA-v1-17M-hg38
+revision: e8e18f84ff71dcd4a3a84ff130fe763a7e636ebb
+
+# Index into outputs.hidden_states; -1 is the last hidden state.
+layer_index: -1
+
+# Effective batch is min(batch_size, gen_chunk_size), so raise both together.
+batch_size: 1024
+
+update_config: false
+train_output_path: data/hg38/train_mistraldna_${seq_length}_hg38_per_token.h5
+val_output_path: data/hg38/val_mistraldna_${seq_length}_hg38_per_token.h5
+test_output_path: data/hg38/test_mistraldna_${seq_length}_hg38_per_token.h5
