@@ -1,0 +1,9 @@
+defaults:
+  - hg38_multilen_seqdisjoint/_base@_here_
+  - _self_
+
+fm_slug: genalm
+embedding_dim: 768
+tokenizer:
+  type: char
+checkpoint: AIRI-Institute/gena-lm-bert-base-t2t
