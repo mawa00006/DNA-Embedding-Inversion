@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - /generate_common
+  - _self_
+
+checkpoint: InstaDeepAI/nucleotide-transformer-2.5b-multi-species
+revision: b746b125aacd1b0970c05a32fd71ba726754542e
+
+# Index into outputs.hidden_states; -1 is the last hidden state.
+layer_index: -1
+
+# 2.5B params in fp32: needs an L40S, not the 1080ti/A4000 the smaller
+# generators target. Effective batch is min(batch_size, gen_chunk_size), so
+# raise both together.
+batch_size: 1024
+
+update_config: false
+train_output_path: data/hg38/train_ntv1_${seq_length}_hg38_per_token.h5
+val_output_path: data/hg38/val_ntv1_${seq_length}_hg38_per_token.h5
+test_output_path: data/hg38/test_ntv1_${seq_length}_hg38_per_token.h5
