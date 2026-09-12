@@ -1,0 +1,9 @@
+defaults:
+  - hg38_multilen_seqdisjoint/_base@_here_
+  - _self_
+
+fm_slug: seqlens
+embedding_dim: 512
+tokenizer:
+  type: char
+checkpoint: omicseye/seqLens_32768_512_30M
