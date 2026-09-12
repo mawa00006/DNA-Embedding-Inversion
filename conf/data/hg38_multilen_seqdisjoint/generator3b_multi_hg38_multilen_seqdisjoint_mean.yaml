@@ -1,9 +1,0 @@
-defaults:
-  - hg38_multilen_seqdisjoint/_base@_here_
-  - _self_
-
-fm_slug: generator3b
-embedding_dim: 3072
-tokenizer:
-  type: char
-checkpoint: GenerTeam/GENERator-eukaryote-3b-base

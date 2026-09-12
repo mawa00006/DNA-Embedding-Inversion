@@ -1,9 +1,0 @@
-defaults:
-  - hg38_multilen_seqdisjoint/_base@_here_
-  - _self_
-
-fm_slug: biofm
-embedding_dim: 640
-tokenizer:
-  type: char
-checkpoint: m42-health/BioFM-265M
