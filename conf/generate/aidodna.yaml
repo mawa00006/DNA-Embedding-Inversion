@@ -1,0 +1,22 @@
+# @package _global_
+defaults:
+  - /generate_common
+  - _self_
+
+# genbio-ai/AIDO.DNA-300M redirects here; genbio-ai/GB.DNA-300M is the
+# canonical id the HF Hub API resolves it to. See generate_aidodna_embeddings.py
+# for why this checkpoint needs the `modelgenerator` package, not
+# trust_remote_code, to load.
+checkpoint: genbio-ai/GB.DNA-300M
+revision: a833c5602b0dad0728c0aeeecaf43086ebeb96ca
+
+# Index into outputs.hidden_states; -1 is the last hidden state.
+layer_index: -1
+
+# Effective batch is min(batch_size, gen_chunk_size), so raise both together.
+batch_size: 1024
+
+update_config: false
+train_output_path: data/hg38/train_aidodna_${seq_length}_hg38_per_token.h5
+val_output_path: data/hg38/val_aidodna_${seq_length}_hg38_per_token.h5
+test_output_path: data/hg38/test_aidodna_${seq_length}_hg38_per_token.h5
