@@ -1,0 +1,18 @@
+# @package _global_
+defaults:
+  - /generate_common
+  - _self_
+
+checkpoint: PoetschLab/GROVER
+revision: 6b223110f0d6963e849f55bc2a2f3cff0e38c7a4
+
+# Index into outputs.hidden_states; -1 is the last hidden state.
+layer_index: -1
+
+# Effective batch is min(batch_size, gen_chunk_size), so raise both together.
+batch_size: 1024
+
+update_config: false
+train_output_path: data/hg38/train_grover_${seq_length}_hg38_per_token.h5
+val_output_path: data/hg38/val_grover_${seq_length}_hg38_per_token.h5
+test_output_path: data/hg38/test_grover_${seq_length}_hg38_per_token.h5

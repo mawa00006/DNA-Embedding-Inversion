@@ -1,0 +1,9 @@
+defaults:
+  - hg38_multilen_seqdisjoint/_base@_here_
+  - _self_
+
+fm_slug: grover
+embedding_dim: 768
+tokenizer:
+  type: char
+checkpoint: PoetschLab/GROVER
