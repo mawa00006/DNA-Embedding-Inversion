@@ -35,13 +35,12 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
 # Foundation model display names and internal keys
 FM_CONFIG = {
+    "hyenadna_large": "HyenaDNA-1M",
     "caduceus": "Caduceus-PH",
     "dnabert1": "DNABERT-1",
     "grover": "GROVER",
     "genalm": "GENA-LM",
     "mistraldna": "Mistral-DNA",
-    "biofm": "Bio-FM",
-    "generator3b": "GENERator-3B",
     "seqlens": "seqLens",
     "aidodna": "AIDO.DNA",
     "ntv1": "NT-v1",
