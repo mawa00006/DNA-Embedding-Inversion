@@ -182,13 +182,16 @@ def _load_dnabert1(checkpoint: str, revision: Optional[str], device: str):
     tokenizer = AutoTokenizer.from_pretrained(
         checkpoint, revision=revision, trust_remote_code=True
     )
-    # AutoModel loads the bare backbone against masked-LM weights, so missing
-    # weights would otherwise be silently random-initialised and only logged.
-    # trust_remote_code resolves the checkpoint's thin BertModel subclass
-    # (dnabert_layer.BertModel), which is a plain pass-through over
-    # transformers' own BertModel.
+    # NOT trust_remote_code for the model. The checkpoint ships its own
+    # BertConfig/BertModel, but AutoModel resolves the class to transformers'
+    # stock BertModel and then rejects the remote config:
+    #   "model has <BertConfig> and you passed <transformers_modules...BertConfig>"
+    # Measured on the cluster. Both remote classes are one-line pass-throughs
+    # (`super().__init__(config)`), so stock loading is behaviourally identical
+    # and is the only form that loads at all. The tokenizer still needs remote
+    # code for its k-mer vocabulary.
     model, loading_info = AutoModel.from_pretrained(
-        checkpoint, revision=revision, trust_remote_code=True, output_loading_info=True
+        checkpoint, revision=revision, output_loading_info=True
     )
     assert not loading_info["missing_keys"], (
         f"Missing keys loading bare backbone from masked-LM checkpoint: "

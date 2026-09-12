@@ -181,9 +181,13 @@ def _load_ntv1(checkpoint: str, revision: Optional[str], device: str):
     model, loading_info = AutoModel.from_pretrained(
         checkpoint, revision=revision, trust_remote_code=True, output_loading_info=True
     )
-    assert not loading_info["missing_keys"], (
-        f"Missing keys loading bare backbone from masked-LM checkpoint: "
-        f"{loading_info['missing_keys']}"
+    # EsmModel always adds a pooler, which this masked-LM checkpoint does not
+    # carry, so `esm.pooler.*` is randomly initialised on every load. Measured on
+    # the cluster. It is never read -- embeddings come from hidden_states -- so it
+    # is excluded rather than allowed to mask a genuinely corrupt load.
+    unexpected = [k for k in loading_info["missing_keys"] if "pooler" not in k]
+    assert not unexpected, (
+        f"Missing keys loading bare backbone from masked-LM checkpoint: {unexpected}"
     )
 
     assert tokenizer.pad_token is not None, "NTv1 tokenizer has no pad token"
