@@ -1,0 +1,9 @@
+defaults:
+  - hg38_multilen_seqdisjoint/_base@_here_
+  - _self_
+
+fm_slug: aidodna
+embedding_dim: 1024
+tokenizer:
+  type: char
+checkpoint: genbio-ai/GB.DNA-300M
