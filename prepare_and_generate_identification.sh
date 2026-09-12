@@ -25,7 +25,7 @@ LOCUS_MODES=(random snp_enriched)
 # At N=1000, K=4096, 2 hap = ~8.2M mean vectors/mode: DNABERT-2 (768-d) ~26 GB,
 # NTv2 (1024-d) ~34 GB, Evo2 (4096-d) ~131 GB per mode. Generation is resumable
 # (existing H5s are skipped), so stage Evo2 separately if disk is tight.
-FMS=(ntv2 dnabert2 evo2)
+FMS=(ntv2 dnabert2 evo2 caduceus dnabert1 grover genalm mistraldna biofm generator3b seqlens aidodna ntv1)
 COHORT_SIZE=1000
 # Total loci per individual. K=4096 gives a long k-axis (4x the old 1000) so
 # identification_model can fit (d, r) and extrapolate the k required for a target
