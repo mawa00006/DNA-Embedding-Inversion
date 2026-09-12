@@ -13,7 +13,7 @@ SOURCE_HG38=${SOURCE_HG38:-$HG38_DATA_DIR/hg38_multilen_seqdisjoint.h5}
 SOURCE_1000G=${SOURCE_1000G:-$DATA_DIR/1000g_multilen_seqdisjoint.h5}
 NUM_SEQUENCES=${NUM_SEQUENCES:-15000}
 LENGTHS=(10 15 20 25 30 35 40 45 50 60 70 80 90 100)
-FMS=(dnabert2 evo2 ntv2 caduceus dnabert1 grover genalm mistraldna biofm generator3b seqlens aidodna ntv1)
+FMS=(dnabert2 evo2 ntv2 caduceus dnabert1 grover genalm mistraldna seqlens aidodna ntv1 hyenadna_large)
 JOB_IDX=0
 
 wait_for_jobs() {
