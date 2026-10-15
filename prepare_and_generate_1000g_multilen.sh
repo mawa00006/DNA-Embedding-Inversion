@@ -13,7 +13,12 @@ SOURCE_HG38=${SOURCE_HG38:-$HG38_DATA_DIR/hg38_multilen_seqdisjoint.h5}
 SOURCE_1000G=${SOURCE_1000G:-$DATA_DIR/1000g_multilen_seqdisjoint.h5}
 NUM_SEQUENCES=${NUM_SEQUENCES:-15000}
 LENGTHS=(10 15 20 25 30 35 40 45 50 60 70 80 90 100)
-FMS=(dnabert2 evo2 ntv2)
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+FMS=($(python -c "import sys;sys.path.insert(0,sys.argv[1]);from src.model_registry import slugs_for;print(' '.join(slugs_for('ood_1000g')))" "$REPO_ROOT"))
+if [ "${#FMS[@]}" -eq 0 ]; then
+    echo "No models tagged ood_1000g in src/model_registry.py" >&2
+    exit 1
+fi
 JOB_IDX=0
 
 wait_for_jobs() {
@@ -54,10 +59,10 @@ for LEN in "${LENGTHS[@]}"; do
         GPU_ID=$((JOB_IDX % NUM_GPUS))
         wait_for_jobs
         echo "[$FM] Generating length-$LEN 1000G OOD embeddings on GPU $GPU_ID..."
-        CUDA_VISIBLE_DEVICES=$GPU_ID python "generate/generate_${FM}_embeddings.py" \
+        GEN_ARGV=($(python -c "import sys;sys.path.insert(0,sys.argv[1]);from src.model_registry import generator_argv;print(' '.join(generator_argv(sys.argv[2])))" "$REPO_ROOT" "$FM"))
+        CUDA_VISIBLE_DEVICES=$GPU_ID python "${GEN_ARGV[@]}" \
             input_path="$SOURCE_1000G" \
             seq_length="$LEN" \
-            num_sequences="$NUM_SEQUENCES" \
             mean=true \
             deduplicate_sequences=false \
             train_split=1.0 \

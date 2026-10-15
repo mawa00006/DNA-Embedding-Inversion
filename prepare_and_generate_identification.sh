@@ -25,7 +25,12 @@ LOCUS_MODES=(random snp_enriched)
 # At N=1000, K=4096, 2 hap = ~8.2M mean vectors/mode: DNABERT-2 (768-d) ~26 GB,
 # NTv2 (1024-d) ~34 GB, Evo2 (4096-d) ~131 GB per mode. Generation is resumable
 # (existing H5s are skipped), so stage Evo2 separately if disk is tight.
-FMS=(ntv2 dnabert2 evo2)
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+FMS=($(python -c "import sys;sys.path.insert(0,sys.argv[1]);from src.model_registry import slugs_for;print(' '.join(slugs_for('identification')))" "$REPO_ROOT"))
+if [ "${#FMS[@]}" -eq 0 ]; then
+    echo "No models tagged identification in src/model_registry.py" >&2
+    exit 1
+fi
 COHORT_SIZE=1000
 # Total loci per individual. K=4096 gives a long k-axis (4x the old 1000) so
 # identification_model can fit (d, r) and extrapolate the k required for a target
@@ -124,18 +129,18 @@ generate_one() {
         echo "[Skip] $OUT_H5 already complete."
         return
     fi
-    local GEN_SCRIPT="generate/generate_${FM}_embeddings.py"
-    if [ ! -f "$GEN_SCRIPT" ]; then
-        echo "[Skip] Missing generator script $GEN_SCRIPT"
+    local GEN_ARGV
+    GEN_ARGV=($(python -c "import sys;sys.path.insert(0,sys.argv[1]);from src.model_registry import generator_argv;print(' '.join(generator_argv(sys.argv[2])))" "$REPO_ROOT" "$FM"))
+    if [ ! -f "${GEN_ARGV[0]}" ]; then
+        echo "[Skip] Missing generator script ${GEN_ARGV[0]}"
         return
     fi
     local GPU_ID=$(( ${JOB_IDX:-0} % NUM_GPUS ))
     echo "[$FM] Generating identification embeddings (L=$LEN, mode=$MODE) on GPU $GPU_ID..."
     wait_for_jobs
-    CUDA_VISIBLE_DEVICES=$GPU_ID python "$GEN_SCRIPT" \
+    CUDA_VISIBLE_DEVICES=$GPU_ID python "${GEN_ARGV[@]}" \
         input_path="$IN_CSV" \
         seq_length="$LEN" \
-        num_sequences=99999999 \
         mean=true \
         identification_mode=true \
         update_config=false \

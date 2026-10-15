@@ -319,6 +319,7 @@ def generate_split_h5_resumable(
     logger: logging.Logger,
     val_size: int | None = None,
     test_size: int | None = None,
+    extra_attrs: Dict[str, Any] | None = None,
 ) -> Dict[str, str]:
     """Embed ``sequences`` into resumable train/val/test HDF5 files.
 
@@ -330,6 +331,9 @@ def generate_split_h5_resumable(
     When ``val_size``/``test_size`` are given the split is sized by fixed counts
     (constant val/test, variable train) instead of the ``train_split``/``val_split``
     fractions -- see ``deterministic_split_labels``.
+
+    ``extra_attrs`` (e.g. layer provenance) is stamped onto every output file in
+    the same pass as the train stats, so a completed file never needs reopening.
     """
     for split in SPLITS:
         assert split in out_paths, f"out_paths missing '{split}'"
@@ -407,6 +411,7 @@ def generate_split_h5_resumable(
             f.attrs["emb_max"] = train_stats["max"]
             f.attrs["emb_mean"] = train_stats["mean"]
             f.attrs["emb_std"] = train_stats["std"]
+            f.attrs.update(extra_attrs or {})
             f.attrs["generation_complete"] = True
     finally:
         for f in handles_by_path.values():
@@ -461,12 +466,16 @@ def generate_identification_h5_resumable(
     checkpoint: str,
     chunk_size: int,
     logger: logging.Logger,
+    extra_attrs: Dict[str, Any] | None = None,
 ) -> str:
     """Embed a per-individual identification cohort into a resumable HDF5 file.
 
     Rows are written in input order (no shuffle, no split, no train stats) with
     their aligned ``(individual_id, locus_id, haplotype)`` labels. Only the
     missing suffix is embedded on resume. Returns the file's SHA256.
+
+    ``extra_attrs`` (e.g. layer provenance) is stamped alongside the completion
+    marker, so a completed file never needs reopening.
     """
     n = len(sequences)
     assert len(individual_ids) == n and len(locus_ids) == n and len(haplotypes) == n, (
@@ -524,6 +533,7 @@ def generate_identification_h5_resumable(
         f.attrs["embedding_dim"] = embedding_dim
         f.attrs["checkpoint"] = checkpoint
         f.attrs["identification_mode"] = True
+        f.attrs.update(extra_attrs or {})
         f.attrs["generation_complete"] = True
     finally:
         f.close()
@@ -542,13 +552,15 @@ def run_generation(
     haplotypes,
     make_embed_chunk: Callable[[], Callable[[List[str]], List[np.ndarray]]],
     logger: logging.Logger,
+    extra_attrs: Dict[str, Any] | None = None,
 ) -> bool:
     """Run the resumable mean / identification generation when applicable.
 
     Shared across the three embedding generators. ``make_embed_chunk()`` loads the
     model (once) and returns ``embed_chunk``; it is only invoked when there is work
     to do, so an already-complete output is a cheap no-op (no model load). The
-    embedding dimension is probed from the first sequence here.
+    embedding dimension is probed from the first sequence here. ``extra_attrs``
+    (e.g. layer provenance) is stamped onto the outputs at finalize time.
 
     Returns True if generation was handled here (the caller should return), or
     False for the legacy all-at-once per-token (``mean=false``) case, which the
@@ -581,6 +593,7 @@ def run_generation(
             checkpoint=checkpoint,
             chunk_size=chunk_size,
             logger=logger,
+            extra_attrs=extra_attrs,
         )
         return True
 
@@ -609,6 +622,7 @@ def run_generation(
             logger=logger,
             val_size=val_size,
             test_size=test_size,
+            extra_attrs=extra_attrs,
         )
         if cfg.update_config:
             config_path = hy_utils.to_absolute_path(cfg.update_config)

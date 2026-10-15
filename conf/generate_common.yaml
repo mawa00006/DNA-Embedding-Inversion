@@ -2,7 +2,10 @@ device: cuda:0
 input_path: null
 update_config: null
 
-num_sequences: 1000000
+# null -> embed every row the input holds (for a multi-length HDF5, the whole
+# lengths/<seq_length> group), making the corpus builder the only place a
+# per-length sample count is chosen. Set an int only to cap a run deliberately.
+num_sequences: null
 seq_length: 0
 seed: 42
 mean: false

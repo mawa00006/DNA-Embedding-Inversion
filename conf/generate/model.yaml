@@ -1,0 +1,20 @@
+# @package _global_
+defaults:
+  - /generate_common
+  - _self_
+
+# Selects the spec in src/model_registry.py, which owns checkpoint, revision
+# and layer_index. Set on the command line: fm_slug=grover
+fm_slug: ???
+
+# Overwritten from the registry in main(); declared so run_generation can stamp
+# it as input provenance without leaving Hydra's struct mode.
+checkpoint: null
+
+# Effective batch is min(batch_size, gen_chunk_size), so raise both together.
+batch_size: 1024
+
+update_config: false
+train_output_path: data/hg38/train_${fm_slug}_${seq_length}_hg38_per_token.h5
+val_output_path: data/hg38/val_${fm_slug}_${seq_length}_hg38_per_token.h5
+test_output_path: data/hg38/test_${fm_slug}_${seq_length}_hg38_per_token.h5

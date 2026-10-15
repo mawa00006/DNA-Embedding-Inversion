@@ -13,17 +13,18 @@ DATA_DIR=${DATA_DIR:-data/hg38_multilen_seqdisjoint}
 SOURCE_H5=${SOURCE_H5:-$DATA_DIR/hg38_multilen_seqdisjoint.h5}
 HG38_FASTA=${HG38_FASTA:-data/hg38.fa}
 LENGTHS=(10 15 20 25 30 35 40 45 50 60 70 80 90 100)
-FMS=(dnabert2 evo2 ntv2)
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+FMS=($(python -c "import sys;sys.path.insert(0,sys.argv[1]);from src.model_registry import slugs_for;print(' '.join(slugs_for('hg38_multilen')))" "$REPO_ROOT"))
+if [ "${#FMS[@]}" -eq 0 ]; then
+    echo "ERROR: no models tagged hg38_multilen in src/model_registry.py" >&2
+    exit 1
+fi
 VAL_SIZE=50000
 TEST_SIZE=50000
 JOB_IDX=0
 
-declare -A TOTAL_SEQS=(
-    [10]=1000000 [15]=1000000 [20]=1000000
-    [25]=2000000 [30]=2000000 [35]=2000000 [40]=2000000 [45]=2000000
-    [50]=3000000 [60]=3000000 [70]=3000000 [80]=3000000
-    [90]=4000000 [100]=4000000
-)
+# Per-length sample counts live only in scripts/prepare_hg38_multilen.py; the
+# generators embed whatever the corpus built (num_sequences defaults to null).
 
 wait_for_jobs() {
     while [ "$(jobs -r | wc -l)" -ge "$MAX_JOBS" ]; do
@@ -58,7 +59,6 @@ fi
 
 mkdir -p "$DATA_DIR"
 for LEN in "${LENGTHS[@]}"; do
-    TOTAL=${TOTAL_SEQS[$LEN]}
     for FM in "${FMS[@]}"; do
         TRAIN="$DATA_DIR/train_${FM}_${LEN}_hg38_multilen_seqdisjoint.h5"
         VAL="$DATA_DIR/val_${FM}_${LEN}_hg38_multilen_seqdisjoint.h5"
@@ -69,11 +69,11 @@ for LEN in "${LENGTHS[@]}"; do
         fi
         GPU_ID=$((JOB_IDX % NUM_GPUS))
         wait_for_jobs
-        echo "[$FM] Embedding length $LEN ($TOTAL unique windows) on GPU $GPU_ID..."
-        CUDA_VISIBLE_DEVICES=$GPU_ID python "generate/generate_${FM}_embeddings.py" \
+        echo "[$FM] Embedding length $LEN on GPU $GPU_ID..."
+        GEN_ARGV=($(python -c "import sys;sys.path.insert(0,sys.argv[1]);from src.model_registry import generator_argv;print(' '.join(generator_argv(sys.argv[2])))" "$REPO_ROOT" "$FM"))
+        CUDA_VISIBLE_DEVICES=$GPU_ID python "${GEN_ARGV[@]}" \
             input_path="$SOURCE_H5" \
             seq_length="$LEN" \
-            num_sequences="$TOTAL" \
             mean=true \
             deduplicate_sequences=false \
             val_size="$VAL_SIZE" \

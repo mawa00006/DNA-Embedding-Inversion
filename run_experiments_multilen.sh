@@ -10,7 +10,12 @@ MULTI_EPOCHS=${MULTI_EPOCHS:-20}
 BWA_THREADS=${BWA_THREADS:-8}
 ID_REPETITIONS=${ID_REPETITIONS:-50}
 export MAX_JOBS NUM_GPUS SLEEP_TIME BWA_THREADS ID_REPETITIONS
-FMS=(dnabert2 evo2 ntv2)
+REPO_ROOT=${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
+FMS=($(python -c "import sys;sys.path.insert(0,sys.argv[1]);from src.model_registry import slugs_for;print(' '.join(slugs_for('hg38_multilen')))" "$REPO_ROOT"))
+if [ "${#FMS[@]}" -eq 0 ]; then
+    echo "ERROR: no models tagged hg38_multilen in src/model_registry.py" >&2
+    exit 1
+fi
 JOB_IDX=0
 
 wait_for_jobs() {
