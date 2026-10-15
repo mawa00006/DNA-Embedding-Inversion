@@ -58,3 +58,7 @@ seq_length: 100
 skip_sha256_check: true
 normalization_method: standard
 subset_fraction: null
+# Cap per sequence-length file, so every length contributes equally. Takes
+# precedence over subset_fraction, which instead scales each length by the
+# same ratio and so preserves the corpus's 1M/2M/3M/4M ramp.
+max_samples: null

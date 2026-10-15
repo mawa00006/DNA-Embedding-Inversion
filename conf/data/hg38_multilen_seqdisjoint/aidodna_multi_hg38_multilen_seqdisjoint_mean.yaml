@@ -6,4 +6,4 @@ fm_slug: aidodna
 embedding_dim: 1024
 tokenizer:
   type: char
-checkpoint: genbio-ai/GB.DNA-300M
+checkpoint: genbio-ai/AIDO.DNA-300M

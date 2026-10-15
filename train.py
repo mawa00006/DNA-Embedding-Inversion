@@ -143,9 +143,9 @@ def main(cfg: DictConfig) -> None:  # noqa: D401
     # All datasets use training set statistics for normalization to prevent data leakage
     loaders = {}
     for split in ["train", "val"]:
-        max_samples = None
-        if split == "val":
-            max_samples = cfg.train.max_val_samples
+        max_samples = (
+            cfg.train.max_val_samples if split == "val" else cfg.data.get("max_samples")
+        )
 
         if is_multi:
             # Train shards may add extra per-length data (train_seq_lengths);

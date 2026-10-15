@@ -3,8 +3,8 @@
 Reads evaluation_results.json files from each FM's eval directory, filters to a
 single inversion architecture (``--inversion-model``, e.g. ``encoder`` or
 ``query_decoder``), and produces publication-ready Levenshtein Similarity and
-Accuracy vs Sequence Length plots comparing DNABERT-2, Evo 2, NTv2 + Random
-Baseline.
+Accuracy vs Sequence Length plots comparing every registered foundation model
++ Random Baseline.
 """
 
 import argparse
@@ -13,13 +13,14 @@ import os
 import logging
 
 import numpy as np
-import torch
 import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+from src import model_registry
 from src.plotting_utils import (
     configure_plot_style,
+    get_class_style,
     get_fm_color,
     get_series_color,
     PLOT_STYLE,
@@ -33,21 +34,10 @@ configure_plot_style()
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
-# Foundation model display names and internal keys
-FM_CONFIG = {
-    "hyenadna_large": "HyenaDNA-1M",
-    "caduceus": "Caduceus-PH",
-    "dnabert1": "DNABERT-1",
-    "grover": "GROVER",
-    "genalm": "GENA-LM",
-    "mistraldna": "Mistral-DNA",
-    "seqlens": "seqLens",
-    "aidodna": "AIDO.DNA",
-    "ntv1": "NT-v1",
-    "dnabert2": "DNABERT-2",
-    "evo2": "Evo 2",
-    "ntv2": "NTv2",
-}
+# Foundation model display names and internal keys. Registry order is the
+# legend/marker order; directory-name detection below scans it in that order, so
+# more specific slugs must not be shadowed by a prefix of an earlier one.
+FM_CONFIG = {s: model_registry.get(s).display_name for s in model_registry.slugs()}
 
 
 def _load_architecture_results(eval_dir: str, inversion_model: str):
@@ -121,24 +111,32 @@ def _plot_metric(
     baseline_std_key: str = None,
 ):
     """Create a single metric vs sequence length plot."""
-    plt.figure(figsize=PLOT_STYLE["figsize"])
-    markers = ["o", "s", "^"]
+    # Wider than the shared default: the legend sits outside the axes so that
+    # twelve entries never cover the curves.
+    plt.figure(figsize=(11, 5.5))
 
     for idx, (fm_key, display_name) in enumerate(FM_CONFIG.items()):
         if fm_key not in fm_data:
             continue
 
         data = fm_data[fm_key]
-        color = get_fm_color(fm_key)
+        style = get_class_style(fm_key)
+        color = style["color"]
+        label = display_name
+        if style["tokenizer"]:
+            label = f"{display_name}  ({style['tokenizer']})"
 
         plt.plot(
             data["seq_lengths"],
             data[metric_key],
-            marker=markers[idx % len(markers)],
+            marker=style["marker"],
             linestyle="-",
             linewidth=PLOT_STYLE["line_width"],
             markersize=PLOT_STYLE["marker_size"],
-            label=display_name,
+            markevery=(idx % 3, 3),
+            markeredgecolor="white",
+            markeredgewidth=1.2,
+            label=label,
             color=color,
         )
         plt.fill_between(
@@ -146,7 +144,7 @@ def _plot_metric(
             data[metric_key] - data[std_key],
             data[metric_key] + data[std_key],
             color=color,
-            alpha=0.2,
+            alpha=0.08,
         )
 
     # Random baseline — average across all FM datasets at common seq lengths
@@ -204,7 +202,13 @@ def _plot_metric(
     plt.xlabel("Sequence Length", fontsize=PLOT_STYLE["label_fontsize"])
     plt.ylabel(ylabel, fontsize=PLOT_STYLE["label_fontsize"])
     plt.ylim(0, 1.05)
-    plt.legend(fontsize=PLOT_STYLE["legend_fontsize"], loc="upper right")
+    plt.legend(
+        fontsize=PLOT_STYLE["legend_fontsize"],
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False,
+        borderaxespad=0,
+    )
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(f"{output_path}.png", dpi=300, bbox_inches="tight")
@@ -222,6 +226,8 @@ def _load_per_position_accuracy(eval_dir: str):
     """Load per-position accuracy arrays from a per-token eval directory's plot_data.pt."""
     pt_path = os.path.join(eval_dir, "plot_data.pt")
     assert os.path.isfile(pt_path), f"plot_data.pt not found in {eval_dir}"
+    import torch  # only the per-token path needs it
+
     data = torch.load(pt_path, weights_only=False)
     return {
         "model": np.asarray(data["model_position_accuracy"]),
@@ -235,18 +241,21 @@ def _plot_cross_dataset_per_position_accuracy(
 ):
     """Overlay per-position accuracy for all FMs + averaged random baseline."""
     fig, ax = plt.subplots(figsize=PLOT_STYLE["figsize_wide"])
-    markers = ["o", "s", "^"]
-
     for idx, (fm_key, display_name) in enumerate(FM_CONFIG.items()):
         if fm_key not in fm_pos_acc:
             continue
         acc = fm_pos_acc[fm_key]["model"]
-        color = get_fm_color(fm_key)
+        style = get_class_style(fm_key)
         ax.plot(
             np.arange(len(acc)),
             acc,
             label=display_name,
-            color=color,
+            color=style["color"],
+            marker=style["marker"],
+            markevery=(idx % 3 + 1, max(len(acc) // 8, 1)),
+            markersize=PLOT_STYLE["marker_size"],
+            markeredgecolor="white",
+            markeredgewidth=1.2,
             linewidth=PLOT_STYLE["line_width"],
         )
 
@@ -318,7 +327,7 @@ def _plot_merged_ned(
         ned_by_sl = fm_ned[fm_key]
         if seq_length not in ned_by_sl:
             continue
-        color = get_fm_color(fm_key)
+        color = get_class_style(fm_key)["color"]
         sns.histplot(
             ned_by_sl[seq_length],
             bins=shared_bins,

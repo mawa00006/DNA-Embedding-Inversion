@@ -84,3 +84,11 @@ outputs.tar
 data/hg38.fa.sa
 data/hg38.fa.bwt
 data/hg38.fa.pac
+
+# local artifacts
+.DS_Store
+.idea/
+.venv-plots/
+results/
+cluster/
+model_comparison.csv

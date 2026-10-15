@@ -12,6 +12,8 @@ import seaborn as sns
 import numpy as np
 import scipy.stats as stats
 
+from src import model_registry
+
 # ---------------------------------------------------------------------------
 # Style constants
 # ---------------------------------------------------------------------------
@@ -84,6 +86,68 @@ _FM_PRIMARY_COLORS = {
     "other": "#9b59b6",  # vivid purple
 }
 
+# Tokenizer class drives hue and the model's position within its class drives
+# marker, so two models sharing a hue stay separable without colour alone and a
+# figure reads as the tokenisation comparison it is meant to support.
+TOKENIZER_CLASS = {
+    "ntv2": "6-mer non-overlapping",
+    "ntv1": "6-mer non-overlapping",
+    "dnabert1": "6-mer overlapping",
+    "hyenadna_large": "nucleotide",
+    "caduceus": "nucleotide",
+    "aidodna": "nucleotide",
+    "evo2": "nucleotide",
+    "seqlens": "BPE",
+    "genalm": "BPE",
+    "grover": "BPE",
+    "mistraldna": "BPE",
+    "dnabert2": "BPE",
+}
+
+_CLASS_COLORS = {
+    "6-mer non-overlapping": "#2a78d6",
+    "nucleotide": "#eb6834",
+    "BPE": "#1baf7a",
+    "6-mer overlapping": "#4a3aa7",
+}
+_CLASS_MARKERS = ["o", "^", "s", "D", "v"]
+
+_MARKER_BY_SLUG = {}
+for _cls in _CLASS_COLORS:
+    _members = [s_ for s_, c in TOKENIZER_CLASS.items() if c == _cls]
+    for _i, _slug in enumerate(_members):
+        _MARKER_BY_SLUG[_slug] = _CLASS_MARKERS[_i % len(_CLASS_MARKERS)]
+
+
+def _slug_in(name: str) -> Optional[str]:
+    """Longest registry slug appearing in ``name``, or None."""
+    hits = [s_ for s_ in TOKENIZER_CLASS if s_ in name]
+    return max(hits, key=len) if hits else None
+
+
+def get_class_style(name: str) -> Dict[str, str]:
+    """Hue (tokenizer class) and marker (model within class) for one series."""
+    slug = _slug_in(name)
+    if slug is None:
+        return {"color": _FM_PRIMARY_COLORS["other"], "marker": "o", "tokenizer": ""}
+    cls = TOKENIZER_CLASS[slug]
+    return {
+        "color": _CLASS_COLORS[cls],
+        "marker": _MARKER_BY_SLUG[slug],
+        "tokenizer": cls,
+    }
+
+
+# One bucket per registry slug so a multi-FM plot stays readable. The three
+# slugs that predate the registry map onto their established figure colours;
+# every other slug gets its own hue appended below, so no existing plot moves.
+_FM_KEY_BY_SLUG = {s: "dnabert" if s == "dnabert2" else s for s in model_registry.slugs()}
+
+_new_fm_keys = [k for k in dict.fromkeys(_FM_KEY_BY_SLUG.values()) if k not in _FM_PRIMARY_COLORS]
+for _key, _hex in zip(_new_fm_keys, sns.color_palette("colorblind", len(_new_fm_keys)).as_hex()):
+    _FM_PRIMARY_COLORS[_key] = _hex
+    _FM_PALETTES[_key] = sns.light_palette(_hex, n_colors=10, reverse=True).as_hex()
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -96,6 +160,25 @@ def _save_fig(path: str, bbox: bool = True) -> None:
     plt.savefig(f"{path}.png", **kw)
     plt.savefig(f"{path}.pdf", **kw)
     plt.close()
+
+
+def _match_fm(combined: str) -> str:
+    """Foundation-model colour bucket for a free-text model name.
+
+    Registry slugs are tried first because they are the more specific spelling;
+    the substring buckets below predate the registry and still resolve the
+    free-text names in older ``evaluation_results.json`` files.
+    """
+    for slug, key in _FM_KEY_BY_SLUG.items():
+        if slug in combined:
+            return key
+    if "dnabert" in combined:
+        return "dnabert"
+    if "ntv2" in combined or "nucleotide_transformer" in combined:
+        return "ntv2"
+    if "evo" in combined:
+        return "evo2"
+    return "other"
 
 
 def _get_model_properties_from_name(name: str) -> Dict[str, str]:
@@ -112,15 +195,7 @@ def _get_model_properties_from_name(name: str) -> Dict[str, str]:
 
     combined = input_model + " " + inversion_part
 
-    # Foundation model
-    if "dnabert" in combined:
-        fm = "dnabert"
-    elif "ntv2" in combined or "nucleotide_transformer" in combined:
-        fm = "ntv2"
-    elif "evo" in combined:
-        fm = "evo2"
-    else:
-        fm = "other"
+    fm = _match_fm(combined)
 
     # Inversion model. ``query_decoder`` must be checked before ``decoder``
     # because "decoder" is a substring of "query_decoder" -- otherwise both
@@ -291,7 +366,7 @@ def plot_aggregate_metrics(
     """Line plot of metric ± std vs sequence length for multiple models."""
     plt.figure(figsize=PLOT_STYLE["figsize"])
 
-    colors = get_series_colors(list(model_data.keys()))
+    styles = {n: get_class_style(n) for n in model_data}
 
     for idx, (model_name, data) in enumerate(model_data.items()):
         seq_lengths = np.array(data["seq_lengths"])
@@ -301,15 +376,22 @@ def plot_aggregate_metrics(
         order = np.argsort(seq_lengths)
         seq_lengths, means, stds = seq_lengths[order], means[order], stds[order]
 
-        color = colors[model_name]
+        style = styles[model_name]
+        color = style["color"]
+        label = get_model_display_name(model_name)
+        if style["tokenizer"]:
+            label = f"{label}  ({style['tokenizer']})"
         plt.plot(
             seq_lengths,
             means,
-            marker=_MARKERS[idx % len(_MARKERS)],
+            marker=style["marker"],
             linestyle="-",
             linewidth=PLOT_STYLE["line_width"],
             markersize=PLOT_STYLE["marker_size"],
-            label=get_model_display_name(model_name),
+            markevery=(idx % 3, 3),
+            markeredgecolor="white",
+            markeredgewidth=1.2,
+            label=label,
             color=color,
         )
         plt.plot(seq_lengths, means - stds, linestyle="--", linewidth=1.0, color=color, alpha=0.5)

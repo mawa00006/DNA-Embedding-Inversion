@@ -5,6 +5,5 @@ defaults:
 fm_slug: ntv2
 embedding_dim: 1024
 tokenizer:
-  type: huggingface
-  model_name: InstaDeepAI/nucleotide-transformer-v2-500m-multi-species
+  type: char
 checkpoint: InstaDeepAI/nucleotide-transformer-v2-500m-multi-species

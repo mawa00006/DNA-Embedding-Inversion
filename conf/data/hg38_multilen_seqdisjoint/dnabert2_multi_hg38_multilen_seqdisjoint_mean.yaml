@@ -5,6 +5,5 @@ defaults:
 fm_slug: dnabert2
 embedding_dim: 768
 tokenizer:
-  type: huggingface
-  model_name: zhihan1996/DNABERT-2-117M
+  type: char
 checkpoint: zhihan1996/DNABERT-2-117M
